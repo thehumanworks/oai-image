@@ -76,7 +76,13 @@ interface VaultMeta {
 
 export const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 /** A vault nobody has used for this long is wiped (its grant's refresh token is dead by then too). */
-export const VAULT_IDLE_MS = 35 * 24 * 60 * 60 * 1000;
+export const VAULT_IDLE_MS = 400 * 24 * 60 * 60 * 1000;
+/**
+ * Rotate the ChatGPT refresh token at least this often while the connection
+ * is in use, even when the access token is still valid, so the sign-in never
+ * goes stale at OpenAI. Codex itself refreshes after 8 days.
+ */
+export const KEEP_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 /** Renders running at once per sign-in. */
 export const MAX_RUNNING_JOBS = 3;
 const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
@@ -110,6 +116,18 @@ export class Vault extends DurableObject<Env> {
 			const tokens = await this.#loadTokens(key);
 			const identity = readIdentity(tokens.accessToken, tokens.idToken);
 			return { email: identity.email, planType: identity.planType, accountId: identity.accountId };
+		});
+	}
+
+	/**
+	 * Refresh the ChatGPT sign-in if it is due, and mark the vault as in use.
+	 * Called whenever the MCP client refreshes its own token, so a connected
+	 * client keeps the ChatGPT login alive even when no images are made.
+	 */
+	async keepAlive(key: string): Promise<VaultResult<null>> {
+		return this.#guard(async () => {
+			await this.#resolveAuth(key);
+			return null;
 		});
 	}
 
@@ -404,10 +422,10 @@ function credsContext(vaultId: string): string {
 }
 
 function needsRefresh(tokens: StoredTokens): boolean {
+	const last = tokens.lastRefresh ? Date.parse(tokens.lastRefresh) : Number.NaN;
+	if (Number.isFinite(last) && last < Date.now() - KEEP_FRESH_MS) return true;
 	const expiresAt = jwtExpiresAt(tokens.accessToken);
 	if (expiresAt !== undefined) return expiresAt <= Date.now() + REFRESH_WINDOW_MS;
-	if (!tokens.lastRefresh) return false;
-	const last = Date.parse(tokens.lastRefresh);
 	return Number.isFinite(last) && last < Date.now() - REFRESH_INTERVAL_MS;
 }
 

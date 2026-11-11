@@ -1,7 +1,7 @@
-import { OAuthProvider, type OAuthResourceContext } from "@cloudflare/workers-oauth-provider";
+import { OAuthError, OAuthProvider, type OAuthResourceContext } from "@cloudflare/workers-oauth-provider";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "../constants.ts";
 import { escape, handleAuthorize, page } from "./authorize.ts";
-import { type Env, type GrantProps, publicOrigin, SCOPE } from "./env.ts";
+import { type Env, type GrantProps, publicOrigin, SCOPE, vaultStub } from "./env.ts";
 import { serveImage } from "./images.ts";
 import { handleMcpRequest } from "./mcp.ts";
 
@@ -18,7 +18,11 @@ export { Vault } from "./vault.ts";
  */
 
 const ONE_HOUR = 60 * 60;
-const THIRTY_DAYS = 30 * 24 * ONE_HOUR;
+/**
+ * MCP refresh tokens: a grant lives as long as it is used at least once a
+ * year, so users never have to sign in again while they keep using it.
+ */
+const ONE_YEAR = 365 * 24 * ONE_HOUR;
 
 const mcpHandler = {
 	async fetch(request: Request, env: Env, ctx: OAuthResourceContext<GrantProps>): Promise<Response> {
@@ -75,13 +79,32 @@ function providerFor(origin: string): OAuthProvider<Env> {
 				resource_name: `${PACKAGE_NAME} (ChatGPT image generation)`,
 			},
 			accessTokenTTL: ONE_HOUR,
-			refreshTokenTTL: THIRTY_DAYS,
-			// A connection stays signed in while it is used, and ends after 30 idle days.
-			refreshTokenIdleTTL: THIRTY_DAYS,
+			refreshTokenTTL: ONE_YEAR,
+			// Each refresh extends the grant, so an active connection never expires.
+			refreshTokenIdleTTL: ONE_YEAR,
+			tokenExchangeCallback: keepChatGptSignInAlive,
 		});
 		providers.set(origin, provider);
 	}
 	return provider;
+}
+
+/**
+ * Each time the MCP client refreshes its token (about hourly while it is in
+ * use), refresh the ChatGPT sign-in too when it is due. If OpenAI has ended
+ * the sign-in for good, end the grant so the client signs in again instead of
+ * failing on every call. Transient failures never block the client's refresh.
+ */
+async function keepChatGptSignInAlive(options: { grantType: string; props: unknown; env: Env }): Promise<void> {
+	if (options.grantType !== "refresh_token") return;
+	const props = options.props as GrantProps | undefined;
+	if (!props?.vaultId || !props.vaultKey) return;
+	const result = await vaultStub(options.env, props.vaultId)
+		.keepAlive(props.vaultKey)
+		.catch(() => undefined);
+	if (result && !result.ok && result.code === "auth_required") {
+		throw new OAuthError("invalid_grant", { description: "The ChatGPT sign-in has ended. Sign in again." });
+	}
 }
 
 export default {

@@ -42,7 +42,17 @@ MCP access token ──unwraps──▶ grant props { vaultId, vaultKey }   (OAu
 - ChatGPT refresh tokens are single-use. Each vault serializes its refreshes, so concurrent calls never burn the login.
 - If OpenAI rejects the refresh token (expired, revoked, reused), the vault forgets the login and the server revokes the grant, so the client signs in again instead of failing forever.
 - `sign_out` revokes the refresh token at OpenAI, deletes the vault, its jobs and images, and revokes the grant.
-- Housekeeping: jobs and images are deleted after 24 hours; a vault unused for 35 days is wiped. MCP access tokens last 1 hour; refresh tokens 30 days, extended on each use.
+- Housekeeping: jobs and images are deleted after 24 hours; a vault unused for 400 days is wiped.
+
+### How long a sign-in lasts
+
+Users sign in once. The server keeps both halves of the sign-in alive on its own:
+
+- **ChatGPT tokens** are refreshed automatically: before any call when the access token is within 5 minutes of expiring, and at least once every 7 days while the connection is in use, so the refresh token keeps rotating and never goes stale at OpenAI.
+- **The MCP connection**: access tokens last 1 hour and clients refresh them silently. Each of those refreshes also tops up the ChatGPT sign-in when it is due, so a connected client keeps it fresh even when it makes no images. The grant's refresh token lasts a year and is extended on every refresh, so a connection used at least once a year never expires.
+- The sign-in ends only when the user signs out, when OpenAI ends it (password change, revoked session, "log out of all devices"), or after a year with no use. In the first two cases the server ends the grant too, and the client takes the user through sign-in again automatically.
+
+The one gap is a client left unused for a long time: refreshes happen on use, because the server cannot unlock a ChatGPT login without that user's own token. If OpenAI expires an unused refresh token before the client comes back, that user signs in again.
 
 Background renders run inside the vault. The ChatGPT access token they need lives only in memory for the render; nothing decryptable is written for them. If the object restarts mid-render (a deploy, a rare eviction) the job ends as "interrupted" and the user can retry.
 
