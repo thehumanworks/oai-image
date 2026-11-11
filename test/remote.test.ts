@@ -31,6 +31,7 @@ let persistDir = "";
 let approve = false;
 let nextIdentity = { email: "first@example.com", userId: "user-first", accountId: "acct-first", expiresIn: 3600 };
 let renderDelayMs = 1500;
+let refreshFails = false;
 
 before(async () => {
 	if (!enabled) return;
@@ -45,6 +46,7 @@ before(async () => {
 		if (route === "/oauth/token") {
 			const identity = nextIdentity;
 			const isRefresh = request.json?.grant_type === "refresh_token";
+			if (isRefresh && refreshFails) return { status: 401, json: { error: { code: "refresh_token_expired", message: "expired" } } };
 			return {
 				json: {
 					access_token: accessToken({
@@ -151,6 +153,7 @@ class Cookies {
 }
 
 interface Login {
+	clientId: string;
 	accessToken: string;
 	refreshToken: string;
 }
@@ -247,7 +250,7 @@ async function signIn(identity: typeof nextIdentity): Promise<Login> {
 	assert.equal(token.status, 200, await token.clone().text());
 	const tokens = (await token.json()) as { access_token: string; refresh_token: string; scope: string };
 	assert.equal(tokens.scope, "images");
-	return { accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+	return { clientId, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
 }
 
 let requestId = 0;
@@ -477,6 +480,41 @@ test("remote: sign_out revokes the ChatGPT login and ends the connection", { ski
 	// The other user is unaffected.
 	const still = await rpc(first.accessToken, "tools/call", { name: "auth_status", arguments: {} });
 	assert.match(still.result.content[0].text, /first@example\.com/);
+});
+
+async function refreshMcp(login: Login): Promise<Response> {
+	return fetch(`${base}/oauth/token`, {
+		method: "POST",
+		headers: { "Content-Type": "application/x-www-form-urlencoded" },
+		body: new URLSearchParams({
+			grant_type: "refresh_token",
+			refresh_token: login.refreshToken,
+			client_id: login.clientId,
+			resource: `${base}/mcp`,
+		}),
+	});
+}
+
+test("remote: refreshing the MCP token keeps the ChatGPT sign-in fresh", { skip: !enabled }, async () => {
+	const third = await signIn({ email: "third@example.com", userId: "user-third", accountId: "acct-third", expiresIn: 60 });
+	const before = issuer.to("/oauth/token").filter(request => request.json?.grant_type === "refresh_token").length;
+	const refreshed = await refreshMcp(third);
+	assert.equal(refreshed.status, 200, await refreshed.clone().text());
+	const tokens = (await refreshed.json()) as { access_token: string; refresh_token: string };
+	assert.equal(issuer.to("/oauth/token").filter(request => request.json?.grant_type === "refresh_token").length, before + 1);
+	const status = await rpc(tokens.access_token, "tools/call", { name: "auth_status", arguments: {} });
+	assert.match(status.result.content[0].text, /third@example\.com/);
+
+	// When OpenAI ends the sign-in for good, the grant ends too, so the client signs in again.
+	const fourth = await signIn({ email: "fourth@example.com", userId: "user-fourth", accountId: "acct-fourth", expiresIn: 60 });
+	refreshFails = true;
+	try {
+		const rejected = await refreshMcp(fourth);
+		assert.equal(rejected.status, 400);
+		assert.equal(((await rejected.json()) as { error: string }).error, "invalid_grant");
+	} finally {
+		refreshFails = false;
+	}
 });
 
 test("remote: unknown image links are 404", { skip: !enabled }, async () => {
