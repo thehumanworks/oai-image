@@ -1,0 +1,59 @@
+{
+  "name": "oai-image",
+  "version": "0.1.0",
+  "description": "SDK, CLI and MCP server for OpenAI image generation through a ChatGPT subscription (Sign in with ChatGPT).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "oai-image": "dist/cli.js",
+    "oai-image-mcp": "dist/mcp-bin.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp.d.ts",
+      "import": "./dist/mcp.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/cli.js dist/mcp-bin.js",
+    "build:binary": "node scripts/build-binary.mjs",
+    "prepare": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test --test-reporter=spec 'test/**/*.test.ts'",
+    "test:binary": "npm run build:binary && OAI_IMAGE_TEST_BIN=dist-bin/oai-image node --test --test-reporter=spec test/cli.test.ts test/mcp.test.ts",
+    "check": "npm run typecheck && npm run build && npm test"
+  },
+  "keywords": [
+    "openai",
+    "chatgpt",
+    "codex",
+    "image-generation",
+    "gpt-image",
+    "mcp",
+    "cli"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "bun": "^1.4.4",
+    "typescript": "~6.0.3"
+  }
+}

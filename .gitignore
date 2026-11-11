@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.tgz
+generated_images/
+.DS_Store
+dist-bin/
