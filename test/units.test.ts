@@ -67,23 +67,44 @@ test("models: aliases resolve and unknown ids pass through", () => {
 });
 
 test("size: names, pixels, ratios", () => {
-	assert.deepEqual(resolveSize(), { size: "auto", exact: false });
+	assert.deepEqual(resolveSize(), { size: "auto", kind: "auto" });
 	assert.equal(resolveSize("AUTO").size, "auto");
 	assert.equal(resolveSize("landscape").size, "1536x1024");
-	assert.equal(resolveSize("landscape").exact, false);
+	assert.equal(resolveSize("landscape").kind, "preset");
 	assert.deepEqual(resolveSize("2048x1152"), {
 		size: "2048x1152",
+		kind: "exact",
 		width: 2048,
 		height: 1152,
 		shape: "landscape",
 		ratio: "16:9",
-		exact: true,
+		megapixels: 2.36,
 	});
-	assert.equal(resolveSize(undefined, "16:9").size, "1536x864");
-	assert.equal(resolveSize(undefined, "9:16").size, "864x1536");
+	// Ratios fill the ~1.57 MP the backend renders, in multiples of 16.
+	assert.equal(resolveSize(undefined, "16:9").size, "1648x928");
+	assert.equal(resolveSize(undefined, "9:16").size, "928x1648");
+	assert.equal(resolveSize(undefined, "21:9").size, "1904x816");
+	assert.equal(resolveSize(undefined, "9:19.5").size, "848x1840");
 	assert.equal(resolveSize(undefined, "1:1").size, "1024x1024");
 	assert.equal(resolveSize(undefined, "2:3").size, "1024x1536");
-	assert.equal(resolveSize("auto", "3:1").size, "1536x512");
+	assert.equal(resolveSize("auto", "3:1").size, "2160x720");
+});
+
+test("size: presets", () => {
+	assert.deepEqual(resolveSize("phone"), { ...resolveSize(undefined, "9:19.5"), kind: "preset", preset: "phone" });
+	assert.equal(resolveSize("Ultrawide").size, "1904x816");
+	assert.equal(resolveSize("widescreen").ratio, "16:9");
+	assert.equal(resolveSize("story").shape, "portrait");
+	assert.deepEqual(resolveSize("4k"), {
+		size: "3840x2160",
+		kind: "preset",
+		width: 3840,
+		height: 2160,
+		shape: "landscape",
+		ratio: "16:9",
+		preset: "4k",
+		megapixels: 8.29,
+	});
 });
 
 test("size: every ratio-derived size satisfies the documented limits", () => {
@@ -102,6 +123,12 @@ test("size: rejects bad input", () => {
 	assert.throws(() => resolveSize(undefined, "wide"), ValidationError);
 	assert.throws(() => resolveSize(undefined, "4:1"), ValidationError);
 	assert.throws(() => resolveSize(undefined, "0:1"), ValidationError);
+	assert.throws(() => resolveSize("1000x1000"), /multiples of 16/);
+	assert.throws(() => resolveSize("3072x1008"), /ratio may be at most 3:1/);
+	assert.throws(() => resolveSize("4000x2000"), /long edge may be at most 3840px/);
+	assert.throws(() => resolveSize("640x640"), /between 655,360 and 8,294,400 pixels/);
+	// Valid for the model even though this route has not been seen to render it; the result warns instead.
+	assert.equal(resolveSize("1152x2496").size, "1152x2496");
 });
 
 test("size: hint wording", () => {
@@ -109,6 +136,8 @@ test("size: hint wording", () => {
 	assert.equal(sizeHint(resolveSize("1024x1536")), "Output format: portrait image, 1024x1536 pixels.");
 	assert.equal(sizeHint(resolveSize(undefined, "16:9")), "Output format: landscape image, 16:9 aspect ratio.");
 	assert.equal(sizeHint(resolveSize("square")), "Output format: square image, 1:1 aspect ratio.");
+	assert.equal(sizeHint(resolveSize("phone")), "Output format: portrait image, 9:19.5 aspect ratio.");
+	assert.equal(sizeHint(resolveSize("2k")), "Output format: square image, 2048x2048 pixels.");
 });
 
 test("image format: sniffing and dimensions", () => {

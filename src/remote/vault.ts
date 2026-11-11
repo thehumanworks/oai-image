@@ -3,9 +3,9 @@ import { readIdentity, jwtExpiresAt } from "../auth/jwt.ts";
 import type { ResolvedAuth } from "../auth/manager.ts";
 import { refreshTokens, resolveOAuthConfig, revokeTokens } from "../auth/oauth.ts";
 import type { StoredTokens } from "../auth/store.ts";
-import { type GenerateOptions, OaiImage } from "../client.ts";
+import { type GenerateOptions, type ImageWarning, OaiImage, type SizingReport } from "../client.ts";
 import { REFRESH_INTERVAL_MS, REFRESH_WINDOW_MS } from "../constants.ts";
-import { ApiError, AuthRequiredError, LoginError, OaiImageError, UsageLimitError, ValidationError } from "../errors.ts";
+import { AuthRequiredError, type ErrorReport, errorCode, errorReport, OaiImageError, UsageLimitError } from "../errors.ts";
 import { randomToken, type Sealed, seal, unseal } from "./crypto.ts";
 import type { Env } from "./env.ts";
 
@@ -43,9 +43,15 @@ export interface JobOutcome {
 	/** Machine-readable reason for a failed render, e.g. `auth_required`, `usage_limit`. */
 	code?: string;
 	resetsAt?: string;
+	/** Everything known about a failure: code, retryable, request ids. */
+	report?: ErrorReport;
 	operation: "generate" | "edit";
 	model?: string;
-	warnings: string[];
+	/** Plain strings in jobs stored before warnings had codes. */
+	warnings: (ImageWarning | string)[];
+	sizing?: SizingReport;
+	requestId?: string;
+	imagegenRequestId?: string;
 	images: StoredImage[];
 }
 
@@ -83,8 +89,14 @@ export const VAULT_IDLE_MS = 400 * 24 * 60 * 60 * 1000;
  * goes stale at OpenAI. Codex itself refreshes after 8 days.
  */
 export const KEEP_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
-/** Renders running at once per sign-in. */
-export const MAX_RUNNING_JOBS = 3;
+/**
+ * Renders sent to ChatGPT at once per sign-in. Codex never runs image calls
+ * in parallel, and parallel calls from one account coincided with ChatGPT's
+ * edge answering with block pages; further jobs wait their turn.
+ */
+export const MAX_CONCURRENT_RENDERS = 1;
+/** Jobs that may wait behind the running ones before new ones are refused. */
+export const MAX_QUEUED_JOBS = 4;
 const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
 const TOUCH_INTERVAL_MS = 60 * 60 * 1000;
 
@@ -93,6 +105,8 @@ export class Vault extends DurableObject<Env> {
 	readonly #running = new Map<string, { controller: AbortController; done: Promise<void> }>();
 	/** Jobs created before this instance started cannot still be running. */
 	readonly #bootedAt = Date.now();
+	/** Render slots, handed out first come, first served. */
+	readonly #slots = new Slots(MAX_CONCURRENT_RENDERS);
 	#refreshing: Promise<StoredTokens> | undefined;
 
 	/** Store a fresh sign-in. Called once, when the grant is created. */
@@ -150,16 +164,20 @@ export class Vault extends DurableObject<Env> {
 		return this.#guard(async () => {
 			// Fail now, not in the background, if the login is gone.
 			await this.#resolveAuth(key);
-			if (this.#running.size >= MAX_RUNNING_JOBS) {
+			if (this.#running.size >= MAX_CONCURRENT_RENDERS + MAX_QUEUED_JOBS) {
 				throw new OaiImageError(
-					`${MAX_RUNNING_JOBS} images are already rendering for this account. Wait for one to finish.`,
+					`${this.#running.size} images are already rendering or waiting for this account. Wait for one to finish.`,
 				);
 			}
+			const ahead = this.#slots.waitingFor();
 			const now = new Date().toISOString();
 			const job: Job = {
 				id: randomToken(24),
 				status: "working",
-				statusMessage: "Rendering. This usually takes 20 seconds to 2 minutes.",
+				statusMessage:
+					ahead > 0
+						? `Queued behind ${ahead} other image${ahead === 1 ? "" : "s"} for this account; images render one at a time.`
+						: RENDERING_MESSAGE,
 				operation: request.images && request.images.length > 0 ? "edit" : "generate",
 				createdAt: now,
 				lastUpdatedAt: now,
@@ -234,10 +252,27 @@ export class Vault extends DurableObject<Env> {
 	}
 
 	async #render(job: Job, key: string, request: JobRequest, signal: AbortSignal): Promise<void> {
+		const queued = this.#slots.waitingFor() > 0;
+		const release = await this.#slots.acquire(signal);
+		if (!release) return;
+		try {
+			if (queued) {
+				const current = await this.ctx.storage.get<Job>(jobKey(job.id));
+				if (!current || current.status !== "working") return;
+				await this.#update(job.id, { statusMessage: RENDERING_MESSAGE });
+			}
+			await this.#renderNow(job, key, request, signal);
+		} finally {
+			release();
+		}
+	}
+
+	async #renderNow(job: Job, key: string, request: JobRequest, signal: AbortSignal): Promise<void> {
 		const client = new OaiImage({
 			auth: { getAuth: options => this.#resolveAuth(key, options?.rejectedAccessToken) },
 			...(this.env.OAI_IMAGE_BASE_URL ? { baseUrl: this.env.OAI_IMAGE_BASE_URL } : {}),
 		});
+		const startedAt = Date.now();
 		let outcome: JobOutcome;
 		try {
 			const result = await client.generate({ ...request, signal, timeoutMs: RENDER_TIMEOUT_MS });
@@ -261,19 +296,49 @@ export class Vault extends DurableObject<Env> {
 				operation: result.operation,
 				model: result.model,
 				warnings: result.warnings,
+				sizing: result.sizing,
+				requestId: result.requestId,
+				imagegenRequestId: result.imagegenRequestId,
 				images,
 			};
+			log("info", "render finished", {
+				job: job.id,
+				operation: result.operation,
+				ms: Date.now() - startedAt,
+				sent_size: result.sizing.sent.size,
+				actual: result.sizing.actual ? `${result.sizing.actual.width}x${result.sizing.actual.height}` : undefined,
+				warnings: result.warnings.map(warning => warning.code),
+				request_id: result.requestId,
+				queued: this.#slots.queued,
+			});
 		} catch (error) {
 			if (signal.aborted) return;
+			const report = errorReport(error);
 			outcome = {
 				isError: true,
-				message: error instanceof Error ? error.message : String(error),
-				code: errorCode(error),
+				message: report.message,
+				code: report.error,
 				resetsAt: error instanceof UsageLimitError ? error.resetsAt?.toISOString() : undefined,
+				report,
 				operation: job.operation,
 				warnings: [],
 				images: [],
 			};
+			// Enough to tell a size problem from an edge block or a rate limit after the fact. No prompt, no tokens.
+			log("warn", "render failed", {
+				job: job.id,
+				operation: job.operation,
+				ms: Date.now() - startedAt,
+				error: report.error,
+				status: report.status,
+				retryable: report.retryable,
+				request_id: report.request_id,
+				cf_ray: report.cf_ray,
+				cf_mitigated: (error as { cfMitigated?: string }).cfMitigated,
+				size: request.size,
+				aspect_ratio: request.aspectRatio,
+				queued: this.#slots.queued,
+			});
 		}
 		const current = await this.ctx.storage.get<Job>(jobKey(job.id));
 		if (!current || current.status !== "working") {
@@ -429,12 +494,63 @@ function needsRefresh(tokens: StoredTokens): boolean {
 	return Number.isFinite(last) && last < Date.now() - REFRESH_INTERVAL_MS;
 }
 
-export function errorCode(error: unknown): string {
-	if (error instanceof AuthRequiredError) return "auth_required";
-	if (error instanceof UsageLimitError) return "usage_limit";
-	if (error instanceof ValidationError) return "invalid_request";
-	if (error instanceof LoginError) return "login_failed";
-	if (error instanceof ApiError) return "upstream_error";
-	if (error instanceof OaiImageError) return "error";
-	return "internal";
+const RENDERING_MESSAGE = "Rendering. This usually takes 20 seconds to 2 minutes.";
+
+function log(level: "info" | "warn", message: string, fields: Record<string, unknown>): void {
+	console[level](JSON.stringify({ message, ...fields }));
+}
+
+/** A first-come, first-served counting semaphore. */
+class Slots {
+	readonly #size: number;
+	#free: number;
+	readonly #waiting: Array<() => void> = [];
+
+	constructor(size: number) {
+		this.#size = size;
+		this.#free = size;
+	}
+
+	/** How many jobs a new caller would wait behind: 0 when a slot is free. */
+	waitingFor(): number {
+		return this.#free > 0 ? 0 : this.#size + this.#waiting.length;
+	}
+
+	/** How many callers are waiting. */
+	get queued(): number {
+		return this.#waiting.length;
+	}
+
+	/** Wait for a slot. Resolves to its release function, or undefined when `signal` aborts first. */
+	acquire(signal: AbortSignal): Promise<(() => void) | undefined> {
+		if (signal.aborted) return Promise.resolve(undefined);
+		if (this.#free > 0) {
+			this.#free--;
+			return Promise.resolve(this.#releaser());
+		}
+		return new Promise(resolve => {
+			const grant = () => {
+				signal.removeEventListener("abort", abandon);
+				resolve(this.#releaser());
+			};
+			const abandon = () => {
+				const index = this.#waiting.indexOf(grant);
+				if (index >= 0) this.#waiting.splice(index, 1);
+				resolve(undefined);
+			};
+			this.#waiting.push(grant);
+			signal.addEventListener("abort", abandon, { once: true });
+		});
+	}
+
+	#releaser(): () => void {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			const next = this.#waiting.shift();
+			if (next) next();
+			else this.#free++;
+		};
+	}
 }

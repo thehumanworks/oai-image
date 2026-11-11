@@ -30,8 +30,11 @@ export {
 	type ImageBackground,
 	type ImageQuality,
 	type ImageResult,
+	type ImageWarning,
+	type ImageWarningCode,
 	OaiImage,
 	type OaiImageOptions,
+	type SizingReport,
 } from "./client.ts";
 export {
 	CODEX_IMAGE_MODEL,
@@ -46,13 +49,32 @@ export {
 	ApiError,
 	type ApiErrorDetails,
 	AuthRequiredError,
+	type ErrorCode,
+	type ErrorReport,
+	errorCode,
+	errorReport,
 	LoginError,
 	OaiImageError,
+	RateLimitError,
 	ResponseError,
+	UpstreamBlockedError,
 	UsageLimitError,
 	ValidationError,
 } from "./errors.ts";
 export { type ImageFormat, readImageSize, sniffImageFormat } from "./image-format.ts";
 export { type ImageInput } from "./input.ts";
 export { GeneratedImage, type SavedImage, saveImages, type SaveImagesOptions } from "./output.ts";
-export { type ImageShape, type ResolvedSize, resolveSize } from "./size.ts";
+export {
+	type AspectRatio,
+	type CommonRatio,
+	type ImageShape,
+	OBSERVED_PIXEL_BUDGET,
+	type PixelSize,
+	type ResolvedSize,
+	resolveSize,
+	SIZE_LIMITS,
+	SIZE_PRESETS,
+	type SizeInput,
+	type SizeKind,
+	type SizePreset,
+} from "./size.ts";

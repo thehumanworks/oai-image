@@ -15,10 +15,13 @@ import {
 	PACKAGE_VERSION,
 	resolveModel,
 } from "./constants.ts";
-import { AuthRequiredError, OaiImageError, UsageLimitError, ValidationError } from "./errors.ts";
+import { ApiError, AuthRequiredError, OaiImageError, UsageLimitError, ValidationError } from "./errors.ts";
 import { type SavedImage, saveImages } from "./output.ts";
 
-const EXIT = { ok: 0, failure: 1, usage: 2, auth: 3, limit: 4 } as const;
+const EXIT = { ok: 0, failure: 1, usage: 2, auth: 3, limit: 4, retry: 5, size: 6 } as const;
+
+/** Warnings that mean the canvas is not the one asked for; `--strict-size` fails on these. */
+const SIZE_WARNINGS = new Set(["ratio_snapped", "size_reduced", "size_changed", "shape_changed"]);
 
 const HELP = `oai-image ${PACKAGE_VERSION}
 Generate and edit images with OpenAI's image models through your ChatGPT subscription.
@@ -36,8 +39,10 @@ Generate and edit options
   -o, --output <file>       Save to this file ("-" writes the image to stdout)
   -d, --out-dir <dir>       Directory for auto-named files (default: current directory)
   -m, --model <id>          Image model (default: ${DEFAULT_IMAGE_MODEL})
-  -s, --size <size>         auto, WIDTHxHEIGHT, square, landscape, portrait, 2k, 4k
-  -a, --aspect <w:h>        Aspect ratio such as 16:9 (instead of --size)
+  -s, --size <size>         auto, WIDTHxHEIGHT, or a preset: square, landscape, portrait,
+                            phone (9:19.5), ultrawide (21:9), widescreen (16:9), story (9:16), 2k, 4k
+  -a, --aspect <w:h>        Aspect ratio from 1:3 to 3:1, such as 16:9 (instead of --size)
+      --strict-size         Exit with status 6 when the image is not the size or ratio asked for
   -q, --quality <level>     auto, low, medium, high
   -b, --background <kind>   opaque (default), transparent, auto
       --transparent         Same as --background transparent
@@ -51,6 +56,7 @@ Generate and edit options
       --force               Overwrite the --output file if it exists
       --timeout <seconds>   Give up after this long (default: 600)
       --retries <n>         Retry network errors and 502/503/504 this many times (default: 0)
+                            (a block page from ChatGPT's edge is always retried once)
       --json                Print a JSON description of the result
   -Q, --quiet               No progress output
 
@@ -91,6 +97,7 @@ const OPTIONS = {
 	frames: { type: "string" },
 	"frame-ms": { type: "string" },
 	"no-size-hint": { type: "boolean" },
+	"strict-size": { type: "boolean" },
 	extra: { type: "string", multiple: true },
 	force: { type: "boolean" },
 	timeout: { type: "string" },
@@ -166,6 +173,11 @@ function report(error: unknown): number {
 	if (error instanceof UsageLimitError) {
 		process.stderr.write(`oai-image: ${error.message}\n`);
 		return EXIT.limit;
+	}
+	if (error instanceof ApiError && error.retryable) {
+		const wait = error.retryAfterMs ? ` Retry in about ${Math.ceil(error.retryAfterMs / 1000)}s.` : "";
+		process.stderr.write(`oai-image: ${error.message}${wait}\n`);
+		return EXIT.retry;
 	}
 	if (error instanceof OaiImageError) {
 		process.stderr.write(`oai-image: ${error.message}\n`);
@@ -356,10 +368,12 @@ async function generate(flags: Flags, promptWords: string[], requireImages: bool
 		});
 	}
 
-	for (const warning of result.warnings) process.stderr.write(`warning: ${warning}\n`);
+	for (const warning of result.warnings) process.stderr.write(`warning: ${warning.message}\n`);
+	const sizeMissed = flags["strict-size"] === true && result.warnings.some(warning => SIZE_WARNINGS.has(warning.code));
+	const done = sizeMissed ? EXIT.size : EXIT.ok;
 	if (flags.json) {
 		if (!toStdout) process.stdout.write(`${JSON.stringify(describeResult(result, saved), null, 2)}\n`);
-		return EXIT.ok;
+		return done;
 	}
 	for (const { path: file, image } of saved) {
 		process.stdout.write(`${file}\n`);
@@ -368,7 +382,7 @@ async function generate(flags: Flags, promptWords: string[], requireImages: bool
 			process.stderr.write(`  ${size}${image.extension.toUpperCase()}, ${formatBytes(image.byteLength)}\n`);
 		}
 	}
-	return EXIT.ok;
+	return done;
 }
 
 export function describeResult(result: ImageResult, saved: readonly SavedImage[]) {
@@ -392,6 +406,7 @@ export function describeResult(result: ImageResult, saved: readonly SavedImage[]
 		usage: result.usage,
 		requestId: result.requestId,
 		imagegenRequestId: result.imagegenRequestId,
+		sizing: result.sizing,
 		warnings: result.warnings,
 		responseHeaders: result.responseHeaders,
 	};
