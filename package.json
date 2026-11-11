@@ -33,10 +33,14 @@
     "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/cli.js dist/mcp-bin.js",
     "build:binary": "node scripts/build-binary.mjs",
     "prepare": "npm run build",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.worker.json --noEmit",
     "test": "node --test --test-reporter=spec 'test/**/*.test.ts'",
     "test:binary": "npm run build:binary && OAI_IMAGE_TEST_BIN=dist-bin/oai-image node --test --test-reporter=spec test/cli.test.ts test/mcp.test.ts",
-    "check": "npm run typecheck && npm run build && npm test"
+    "check": "npm run typecheck && npm run build && npm test",
+    "test:remote": "OAI_IMAGE_REMOTE_TESTS=1 node --test --test-reporter=spec test/remote.test.ts",
+    "dev:remote": "wrangler dev",
+    "deploy:remote": "wrangler deploy --env=''",
+    "types:remote": "wrangler types src/remote/worker-configuration.d.ts --env-interface WranglerEnv"
   },
   "keywords": [
     "openai",
@@ -52,8 +56,12 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.2.4",
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@modelcontextprotocol/server": "^2.4.0",
     "@types/node": "^24.0.0",
     "bun": "^1.4.4",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "wrangler": "^4.160.0"
   }
 }

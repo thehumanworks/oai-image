@@ -43,7 +43,7 @@ buildNpmPackage {
     mv package-lock.json.tmp package-lock.json
   '';
 
-  npmDepsHash = "sha256-G09NY2vRHraVgrRJijVsHz3eDfYJG1mGGdbH/yAxbl8=";
+  npmDepsHash = "sha256-SXCYw/3j6xeHM8cDWZHjJX7KOlAbQKzBo4GQyVJnA6A=";
 
   doCheck = true;
   checkPhase = ''

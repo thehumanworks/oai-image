@@ -237,6 +237,24 @@ Images are written to disk and the path is returned, along with the image inline
 
 Sign in once with `oai-image login` in a terminal before using the server, or let the model call `login` and follow the link it gives you.
 
+## Hosted MCP server (multi-user)
+
+The repo also deploys to Cloudflare Workers as a remote MCP server that many people can share, each signed in to their own ChatGPT account:
+
+- streamable HTTP on the stateless MCP 2026-07-28 revision, with a fallback for 2025-era clients;
+- the MCP Tasks extension, so image generation never blocks a request;
+- OAuth 2.1 sign-in per the MCP authorization spec, with ChatGPT's device-code login behind it;
+- each user's ChatGPT tokens encrypted with a key only their own connection holds.
+
+```sh
+npx wrangler login
+npm run deploy:remote
+openssl rand -hex 32 | npx wrangler secret put IMAGE_URL_SECRET
+claude mcp add --transport http oai-image https://oai-image.<your-subdomain>.workers.dev/mcp
+```
+
+See [docs/REMOTE.md](docs/REMOTE.md) for how sign-in and isolation work, client setup, and testing.
+
 ## Where your login lives
 
 - `~/.oai-image/auth.json`, mode `0600` (`OAI_IMAGE_HOME` moves the directory). The layout matches Codex's `auth.json`.
@@ -263,6 +281,7 @@ npm test            # node --test, against local mock servers; no network, no cr
 npm run build
 npm run check       # all three
 npm run test:binary # builds dist-bin/oai-image, then runs the CLI and MCP tests against it
+npm run test:remote # runs the hosted server in workerd against local mocks (see docs/REMOTE.md)
 ```
 
 Tests run the TypeScript sources directly (Node 22.18+ or 24), so no build is needed first. `OAI_IMAGE_ISSUER` and `OAI_IMAGE_BASE_URL` point the CLI at other endpoints.

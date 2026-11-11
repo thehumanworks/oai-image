@@ -6,3 +6,5 @@ generated_images/
 dist-bin/
 result
 result-*
+.wrangler/
+.dev.vars*
