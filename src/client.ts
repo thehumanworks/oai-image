@@ -17,13 +17,28 @@ import {
 	type ApiErrorDetails,
 	AuthRequiredError,
 	OaiImageError,
+	RateLimitError,
 	ResponseError,
+	UpstreamBlockedError,
 	UsageLimitError,
 	ValidationError,
 } from "./errors.ts";
 import { type ImageInput, type ImageReference, toImageReference } from "./input.ts";
 import { GeneratedImage } from "./output.ts";
-import { resolveSize, sizeHint } from "./size.ts";
+import {
+	type AspectRatio,
+	type CommonRatio,
+	describeRequest,
+	megapixels,
+	OBSERVED_PIXEL_BUDGET,
+	type ResolvedSize,
+	ratioValue,
+	resolveSize,
+	type SizeInput,
+	type SizeKind,
+	shapeOf,
+	sizeHint,
+} from "./size.ts";
 
 export interface OaiImageOptions {
 	/** Credential source. Default: the saved `oai-image login`. */
@@ -47,6 +62,14 @@ export interface OaiImageOptions {
 	 * failed call may still have used plan quota, so nothing is retried unasked.
 	 */
 	maxRetries?: number;
+	/**
+	 * Retry once when ChatGPT's edge answers with a block or challenge page
+	 * instead of the API (default true). Such a request most likely never
+	 * reached the image model.
+	 */
+	retryBlocked?: boolean;
+	/** Wait before that retry. Default 3000 ms. */
+	blockedRetryDelayMs?: number;
 }
 
 export type ImageQuality = "auto" | "low" | "medium" | "high" | (string & {});
@@ -67,10 +90,14 @@ export interface GenerateOptions {
 	 * `gpt-image-2.6-sunburst`.
 	 */
 	model?: string;
-	/** `auto`, `WIDTHxHEIGHT`, or `square` / `landscape` / `portrait` / `2k` / `4k`. */
-	size?: string;
-	/** Alternative to `size`, e.g. `16:9`. */
-	aspectRatio?: string;
+	/**
+	 * `auto`, `WIDTHxHEIGHT`, or a preset: `square`, `landscape`, `portrait`,
+	 * `phone` (9:19.5), `ultrawide` (21:9), `widescreen` (16:9), `story` (9:16),
+	 * `2k`, `4k`. A request, not a guarantee: see {@link ImageResult.sizing}.
+	 */
+	size?: SizeInput | (string & {});
+	/** Alternative to `size`, e.g. `16:9` or `9:19.5`. From 1:3 to 3:1. */
+	aspectRatio?: CommonRatio | AspectRatio | (string & {});
 	quality?: ImageQuality;
 	/** Default `opaque`, which is what Codex sends unless transparency is asked for. */
 	background?: ImageBackground;
@@ -98,6 +125,50 @@ export interface EditOptions extends GenerateOptions {
 	images: readonly ImageInput[];
 }
 
+/** Requested, sent and actual canvas of a call, so a changed size is visible without decoding the image. */
+export interface SizingReport {
+	/** What the caller passed. */
+	requested: { size?: string; aspectRatio?: string };
+	/** What went in the request: the `size` field and the sentence added to the prompt. */
+	sent: { size: string; kind: SizeKind; hint?: string };
+	/** Read from the first returned image. */
+	actual?: { width: number; height: number; ratio: number; megapixels: number };
+	/** `size` as the backend reported it, when it did. */
+	backendSize?: string;
+}
+
+/** {@link SizingReport} with the snake_case keys tool results use. */
+export function sizingJson(sizing: SizingReport) {
+	return {
+		requested: {
+			...(sizing.requested.size !== undefined ? { size: sizing.requested.size } : {}),
+			...(sizing.requested.aspectRatio !== undefined ? { aspect_ratio: sizing.requested.aspectRatio } : {}),
+		},
+		sent: sizing.sent,
+		...(sizing.actual ? { actual: sizing.actual } : {}),
+		...(sizing.backendSize ? { backend_size: sizing.backendSize } : {}),
+	};
+}
+
+export type ImageWarningCode =
+	/** Same shape, but the width:height ratio is more than 3% off. */
+	| "ratio_snapped"
+	/** Fewer than 80% of the requested pixels. */
+	| "size_reduced"
+	/** Exact pixels were asked for and different ones came back. */
+	| "size_changed"
+	/** Portrait, landscape or square differs from what was asked. */
+	| "shape_changed"
+	| "fewer_images"
+	| "background_ignored"
+	| "not_gif";
+
+/** Something that did not go as asked. `message` is a sentence for people; branch on `code`. */
+export interface ImageWarning {
+	code: ImageWarningCode;
+	message: string;
+}
+
 export interface ImageResult {
 	images: GeneratedImage[];
 	operation: "generate" | "edit";
@@ -120,8 +191,10 @@ export interface ImageResult {
 	usage?: Record<string, unknown>;
 	requestId?: string;
 	imagegenRequestId?: string;
+	/** Requested, sent and actual canvas. */
+	sizing: SizingReport;
 	/** Things that did not go as asked, e.g. a different canvas than requested. */
-	warnings: string[];
+	warnings: ImageWarning[];
 	/** Response body without the image data, for fields this package does not model. */
 	raw: Record<string, unknown>;
 	/** Diagnostic response headers (`x-codex-*`, request ids). */
@@ -129,6 +202,11 @@ export interface ImageResult {
 }
 
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const DEFAULT_BLOCKED_RETRY_DELAY_MS = 3000;
+/** A result ratio this far off the requested one (relative) draws a warning. */
+const RATIO_TOLERANCE = 0.03;
+/** A result with fewer than this share of the requested pixels draws a warning. */
+const PIXEL_TOLERANCE = 0.8;
 
 /** Image generation and editing through a ChatGPT subscription. */
 export class OaiImage {
@@ -190,7 +268,7 @@ export class OaiImage {
 			request.signal,
 			request.timeoutMs ?? this.#options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 		);
-		return buildResult({ json, response, operation, model, prompt: sentPrompt, request, size });
+		return buildResult({ json, response, operation, model, prompt: sentPrompt, request, size, hint });
 	}
 
 	/** Edit images, or generate a new one using them as references. */
@@ -216,6 +294,7 @@ export class OaiImage {
 
 		let auth = await this.auth.getAuth({ signal });
 		let reauthenticated = false;
+		let blockedRetried = this.#options.retryBlocked === false;
 		for (let attempt = 0; ; attempt++) {
 			let response: Response;
 			try {
@@ -282,6 +361,12 @@ export class OaiImage {
 				await backoff(attempt, combined);
 				continue;
 			}
+			// A block page from the edge, not an answer from the API: one retry after a pause.
+			if (!blockedRetried && isBlockPage(response, text)) {
+				blockedRetried = true;
+				await pause(this.#options.blockedRetryDelayMs ?? DEFAULT_BLOCKED_RETRY_DELAY_MS, combined);
+				continue;
+			}
 			throw toApiError(response, text);
 		}
 	}
@@ -339,7 +424,8 @@ function buildResult(args: {
 	model: string;
 	prompt: string;
 	request: GenerateOptions;
-	size: ReturnType<typeof resolveSize>;
+	size: ResolvedSize;
+	hint?: string;
 }): ImageResult {
 	const { json, response, request, size } = args;
 	const { data, ...raw } = json;
@@ -369,26 +455,40 @@ function buildResult(args: {
 		throw new ResponseError(`The backend returned no image data${requestId ? ` (request ${requestId})` : ""}`);
 	}
 
-	const warnings: string[] = [];
 	const first = images[0] as GeneratedImage;
-	if (size.width && size.height && first.width && first.height) {
-		const actual = `${first.width}x${first.height}`;
-		if (size.exact && (first.width !== size.width || first.height !== size.height)) {
-			warnings.push(`Requested ${size.size} but the backend returned ${actual}.`);
-		} else if (!size.exact && shapeOf(first.width, first.height) !== size.shape) {
-			warnings.push(`Requested a ${size.shape} image but the backend returned ${actual}.`);
-		}
-	}
+	const warnings: ImageWarning[] = [];
+	if (first.width && first.height) warnings.push(...sizeWarnings(size, first.width, first.height));
 	const wanted = request.n ?? 1;
 	if (images.length < wanted) {
-		warnings.push(`Requested ${wanted} images but the backend returned ${images.length}.`);
+		warnings.push({ code: "fewer_images", message: `Requested ${wanted} images but the backend returned ${images.length}.` });
 	}
 	if (request.background === "transparent" && raw.background === "opaque") {
-		warnings.push("Requested a transparent background but the backend returned an opaque image.");
+		warnings.push({
+			code: "background_ignored",
+			message: "Requested a transparent background but the backend returned an opaque image.",
+		});
 	}
 	if (request.gif && first.mimeType !== "image/gif") {
-		warnings.push(`Requested a GIF but the backend returned ${first.mimeType}.`);
+		warnings.push({ code: "not_gif", message: `Requested a GIF but the backend returned ${first.mimeType}.` });
 	}
+	const sizing: SizingReport = {
+		requested: {
+			...(request.size !== undefined ? { size: request.size } : {}),
+			...(request.aspectRatio !== undefined ? { aspectRatio: request.aspectRatio } : {}),
+		},
+		sent: { size: size.size, kind: size.kind, ...(args.hint ? { hint: args.hint } : {}) },
+		...(first.width && first.height
+			? {
+					actual: {
+						width: first.width,
+						height: first.height,
+						ratio: round2(first.width / first.height),
+						megapixels: megapixels(first.width, first.height),
+					},
+				}
+			: {}),
+		...(typeof raw.size === "string" ? { backendSize: raw.size } : {}),
+	};
 
 	return {
 		images,
@@ -404,6 +504,7 @@ function buildResult(args: {
 		usage: isRecord(raw.usage) ? raw.usage : undefined,
 		requestId,
 		imagegenRequestId,
+		sizing,
 		warnings,
 		raw,
 		responseHeaders: diagnosticHeaders(response.headers),
@@ -424,8 +525,14 @@ function toApiError(response: Response, text: string): OaiImageError {
 		body: text.slice(0, 2000) || undefined,
 		requestId: response.headers.get("x-request-id") ?? undefined,
 		imagegenRequestId: response.headers.get("x-codex-imagegen-request-id") || undefined,
+		retryable: RETRYABLE_STATUS.has(status),
+		retryAfterMs: retryAfter(response.headers),
+		cfRay: response.headers.get("cf-ray") ?? undefined,
+		cfMitigated: response.headers.get("cf-mitigated") ?? undefined,
+		contentType: response.headers.get("content-type") ?? undefined,
 	};
 	const message = (body && errorMessageFromBody(body)) ?? plainText(text);
+	const ids = idSuffix(details);
 
 	if (status === 401) {
 		// Reached only when a refresh did not help or was not possible, so the login itself is the problem.
@@ -442,16 +549,99 @@ function toApiError(response: Response, text: string): OaiImageError {
 		const parts = [`ChatGPT plan usage limit reached${planType ? ` (${planType} plan)` : ""}.`];
 		if (resetsAt) parts.push(`It resets at ${resetsAt.toLocaleString()}.`);
 		if (message) parts.push(message);
-		return new UsageLimitError(parts.join(" "), { ...details, resetsAt, planType, limitId });
+		return new UsageLimitError(parts.join(" "), { ...details, retryable: false, resetsAt, planType, limitId });
 	}
 	if (status === 429 && type === "usage_not_included") {
-		return new ApiError(
-			`Your ChatGPT plan does not include this usage.${message ? ` ${message}` : ""}`,
-			details,
+		return new ApiError(`Your ChatGPT plan does not include this usage.${message ? ` ${message}` : ""}`, details);
+	}
+	if (isBlockPage(response, text)) {
+		const what = details.cfMitigated === "challenge" ? "a bot challenge" : "an HTML block page";
+		const title = /<title[^>]*>([^<]*)<\/title>/i.exec(text)?.[1]?.trim();
+		return new UpstreamBlockedError(
+			`ChatGPT's edge protection answered with ${what}${title ? ` titled "${title}"` : ""} (HTTP ${status}) instead of the image API${ids}. ` +
+				"The request most likely never reached the image model. It is safe to retry after a short wait; " +
+				"running several images at once from the same account makes this more likely.",
+			{ ...details, retryable: true, retryAfterMs: details.retryAfterMs ?? 30_000 },
+		);
+	}
+	if (status === 429) {
+		return new RateLimitError(
+			`Too many image requests in a short time (HTTP 429)${message ? `: ${message}` : ""}${ids}. Wait and retry.`,
+			{ ...details, retryable: true, retryAfterMs: details.retryAfterMs ?? 30_000 },
 		);
 	}
 	const label = message ?? (response.statusText || "no details");
-	return new ApiError(`Image request failed (HTTP ${status}): ${label}`, details);
+	return new ApiError(`Image request failed (HTTP ${status}): ${label}${ids}`, details);
+}
+
+/**
+ * True when the answer came from ChatGPT's Cloudflare edge rather than the
+ * API: a `cf-mitigated` header, or an HTML page on a 403 or 429. The API
+ * itself always answers in JSON.
+ */
+function isBlockPage(response: Response, text: string): boolean {
+	if (response.headers.get("cf-mitigated")) return true;
+	if (response.status !== 403 && response.status !== 429) return false;
+	const type = response.headers.get("content-type") ?? "";
+	return /text\/html/i.test(type) || /^\s*<(!doctype|html)/i.test(text);
+}
+
+function idSuffix(details: ApiErrorDetails): string {
+	const ids = [
+		details.requestId ? `request ${details.requestId}` : undefined,
+		details.cfRay ? `cf-ray ${details.cfRay}` : undefined,
+	].filter(Boolean);
+	return ids.length > 0 ? ` (${ids.join(", ")})` : "";
+}
+
+function retryAfter(headers: Headers): number | undefined {
+	const value = headers.get("retry-after")?.trim();
+	if (!value) return undefined;
+	if (/^\d+(\.\d+)?$/.test(value)) return Math.round(Number(value) * 1000);
+	const at = Date.parse(value);
+	return Number.isFinite(at) ? Math.max(0, at - Date.now()) : undefined;
+}
+
+/** Warnings for a returned canvas that differs from the requested one. */
+function sizeWarnings(size: ResolvedSize, width: number, height: number): ImageWarning[] {
+	if (size.kind === "auto" || !size.width || !size.height || !size.shape) return [];
+	const actual = `${width}x${height}`;
+	// The ratio as asked, which a canvas rounded to multiples of 16 only approximates.
+	const wanted = (size.ratio ? ratioValue(size.ratio) : undefined) ?? size.width / size.height;
+	const label = describeRequest(size);
+	const warnings: ImageWarning[] = [];
+	const got = width / height;
+	if (shapeOf(width, height) !== size.shape) {
+		warnings.push({ code: "shape_changed", message: `Requested a ${size.shape} image, ${label}, but got ${actual} (${formatRatio(got)}).` });
+	} else if (Math.abs(got - wanted) / wanted > RATIO_TOLERANCE) {
+		warnings.push({
+			code: "ratio_snapped",
+			message: `Requested ${label} (${formatRatio(wanted)}) but got ${actual} (${formatRatio(got)}).`,
+		});
+	}
+	const wantedPixels = size.width * size.height;
+	if (width * height < wantedPixels * PIXEL_TOLERANCE) {
+		const ceiling =
+			wantedPixels > OBSERVED_PIXEL_BUDGET
+				? ` This route has not been seen to return more than about ${megapixels(1536, 1024)} MP.`
+				: "";
+		warnings.push({
+			code: "size_reduced",
+			message: `Requested ${size.size} (${megapixels(size.width, size.height)} MP) but got ${actual} (${megapixels(width, height)} MP).${ceiling}`,
+		});
+	}
+	if (warnings.length === 0 && size.kind === "exact" && (width !== size.width || height !== size.height)) {
+		warnings.push({ code: "size_changed", message: `Requested ${size.size} but got ${actual}.` });
+	}
+	return warnings;
+}
+
+function formatRatio(ratio: number): string {
+	return ratio >= 1 ? `${round2(ratio)}:1` : `1:${round2(1 / ratio)}`;
+}
+
+function round2(value: number): number {
+	return Math.round(value * 100) / 100;
 }
 
 function errorMessageFromBody(body: Record<string, unknown>): string | undefined {
@@ -490,7 +680,11 @@ function diagnosticHeaders(headers: Headers): Record<string, string> {
 }
 
 async function backoff(attempt: number, signal: AbortSignal): Promise<void> {
-	const delay = Math.min(1000 * 2 ** attempt, 8000);
+	await pause(Math.min(1000 * 2 ** attempt, 8000), signal);
+}
+
+async function pause(delay: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return;
 	await new Promise<void>(resolve => {
 		const timer = setTimeout(done, delay);
 		function done() {
@@ -500,10 +694,6 @@ async function backoff(attempt: number, signal: AbortSignal): Promise<void> {
 		}
 		signal.addEventListener("abort", done, { once: true });
 	});
-}
-
-function shapeOf(width: number, height: number): "square" | "landscape" | "portrait" {
-	return width === height ? "square" : width > height ? "landscape" : "portrait";
 }
 
 function parseJson(text: string): Record<string, unknown> | undefined {

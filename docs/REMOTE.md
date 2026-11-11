@@ -14,7 +14,9 @@ https://<your-worker>.workers.dev/mcp
 - **Clients without tasks** get the same work two ways: by default the call waits for the image and sends progress notifications; with `run_in_background: true` it returns a job id to fetch with `get_image_job` (the explicit-handle pattern the 2026 spec recommends for state across calls).
 - **Authorization**: OAuth 2.1 per the MCP authorization spec, via [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider): RFC 9728 protected resource metadata, RFC 8414 server metadata, PKCE, RFC 8707 resource binding, RFC 9207 `iss`, Client ID Metadata Documents, and Dynamic Client Registration for clients that still need it.
 
-Tools: `generate_image`, `edit_image`, `get_image_job`, `auth_status`, `sign_out`. Input images are `data:image/...;base64,` or `https://` URLs; the server cannot read local files. Results carry a download link (signed, valid 24 hours) and the image inline when it is 3 MiB or smaller.
+Tools: `generate_image`, `edit_image`, `get_image_job`, `auth_status`, `sign_out`. Input images are `data:image/...;base64,` or `https://` URLs; the server cannot read local files. Results carry a download link (signed, valid 24 hours) and the image inline when it is 3 MiB or smaller. Finished results also carry `sizing` (requested, sent and actual canvas) and coded `warnings`; failures carry `{ error, message, retryable, retry_after_seconds, status, request_id, cf_ray }`.
+
+Each account renders **one image at a time**. Further calls are accepted and wait in a queue of up to 4 (their status says `Queued behind N other images`); a fifth waiting call is refused. Parallel calls from one account coincided with ChatGPT's edge answering with block pages, and Codex itself never runs image calls in parallel.
 
 ## How signing in works
 
@@ -75,7 +77,7 @@ Optional:
 
 - **Custom domain**: add a route in `wrangler.jsonc` (`"routes": [{ "pattern": "images.example.com", "custom_domain": true }]`) and set `PUBLIC_URL` to `https://images.example.com`.
 - **Backstop for image storage**: `npx wrangler r2 bucket lifecycle add oai-image-images expire-2d --expire-days 2` deletes any image the 24-hour cleanup missed.
-- **Logs**: `npx wrangler tail`. Tokens, prompts and images are never logged.
+- **Logs**: `npx wrangler tail`, or Workers Logs in the dashboard. Each render logs one JSON line: `render finished` (sent and actual size, warning codes, request id) or `render failed` (error code, HTTP status, `cf-ray`, `cf-mitigated`, request id, requested size, queue length). Tokens, prompts and images are never logged.
 
 ## Connect a client
 

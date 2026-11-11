@@ -8,10 +8,18 @@ import { z } from "zod";
 import { openInBrowser } from "./auth/browser-login.ts";
 import { AuthManager, type AuthProvider, defaultAuth, defaultAuthManager } from "./auth/manager.ts";
 import { FileTokenStore } from "./auth/store.ts";
-import { type GenerateOptions, type ImageResult, OaiImage, type OaiImageOptions } from "./client.ts";
+import { type GenerateOptions, type ImageResult, OaiImage, type OaiImageOptions, sizingJson } from "./client.ts";
 import { DEFAULT_IMAGE_MODEL, ENV, KNOWN_IMAGE_MODELS, MAX_INPUT_IMAGES, PACKAGE_NAME, PACKAGE_VERSION } from "./constants.ts";
-import { AuthRequiredError, OaiImageError, UsageLimitError } from "./errors.ts";
+import { AuthRequiredError, errorReport, OaiImageError, UsageLimitError } from "./errors.ts";
 import { expandHome, type SavedImage, saveImages } from "./output.ts";
+import {
+	QUALITY_DESCRIPTION,
+	RATIO_DESCRIPTION,
+	RATIO_PATTERN,
+	SIZE_DESCRIPTION,
+	SIZE_PATTERN,
+	SIZING_INSTRUCTIONS,
+} from "./tool-text.ts";
 
 export interface McpServerOptions {
 	/** Client to generate with. Default: one built from the saved login. */
@@ -37,15 +45,17 @@ const DEFAULT_INLINE_MAX_BYTES = 3 * 1024 * 1024;
 
 const SERVER_INSTRUCTIONS = `Generates and edits images with OpenAI's image models, billed to the user's ChatGPT subscription.
 Images are saved to disk and their paths returned. A generation usually takes 20 seconds to 2 minutes.
-If a tool reports that nobody is signed in, ask the user before calling \`login\`, or tell them to run \`oai-image login\` in a terminal.`;
+If a tool reports that nobody is signed in, ask the user before calling \`login\`, or tell them to run \`oai-image login\` in a terminal.
+${SIZING_INSTRUCTIONS}`;
 
 const sharedShape = {
 	size: z
 		.string()
+		.regex(SIZE_PATTERN, 'Use "auto", a preset name, or WIDTHxHEIGHT such as 1536x1024')
 		.optional()
-		.describe('Canvas: "auto" (default), WIDTHxHEIGHT such as "1536x1024", or "square", "landscape", "portrait", "2k", "4k".'),
-	aspect_ratio: z.string().optional().describe('Aspect ratio such as "16:9", instead of size.'),
-	quality: z.enum(["auto", "low", "medium", "high"]).optional().describe("Rendering quality. Higher is slower and uses more of the plan's limit."),
+		.describe(SIZE_DESCRIPTION),
+	aspect_ratio: z.string().regex(RATIO_PATTERN, "Use WIDTH:HEIGHT, such as 16:9").optional().describe(RATIO_DESCRIPTION),
+	quality: z.enum(["auto", "low", "medium", "high"]).optional().describe(QUALITY_DESCRIPTION),
 	background: z
 		.enum(["auto", "opaque", "transparent"])
 		.optional()
@@ -78,7 +88,21 @@ const resultShape = {
 	),
 	operation: z.enum(["generate", "edit"]),
 	model: z.string().describe("Model id that was requested; the backend does not report which one ran."),
-	warnings: z.array(z.string()),
+	sizing: z
+		.object({
+			requested: z.object({ size: z.string().optional(), aspect_ratio: z.string().optional() }),
+			sent: z.object({ size: z.string(), kind: z.enum(["auto", "exact", "preset", "ratio"]), hint: z.string().optional() }),
+			actual: z.object({ width: z.number(), height: z.number(), ratio: z.number(), megapixels: z.number() }).optional(),
+			backend_size: z.string().optional(),
+		})
+		.describe("What size was asked for, what was sent, and what came back."),
+	warnings: z.array(
+		z.object({
+			code: z.enum(["ratio_snapped", "size_reduced", "size_changed", "shape_changed", "fewer_images", "background_ignored", "not_gif"]),
+			message: z.string(),
+		}),
+	),
+	request_id: z.string().optional(),
 };
 
 interface ToolExtra {
@@ -385,7 +409,7 @@ function success(
 	if (skipped.length > 0) {
 		lines.push(`Not shown inline (larger than ${formatBytes(inlineMaxBytes)}): ${skipped.join(", ")}. Open the file to view it.`);
 	}
-	for (const warning of result.warnings) lines.push(`Warning: ${warning}`);
+	for (const warning of result.warnings) lines.push(`Warning: ${warning.message}`);
 	return {
 		content: [{ type: "text", text: lines.join("\n") }, ...content],
 		structuredContent: {
@@ -398,10 +422,13 @@ function success(
 			})),
 			operation: result.operation,
 			model: result.model,
+			sizing: sizingJson(result.sizing),
 			warnings: result.warnings,
+			...(result.requestId ? { request_id: result.requestId } : {}),
 		},
 	};
 }
+
 
 function failure(error: unknown): CallToolResult {
 	let message = error instanceof Error ? error.message : String(error);
@@ -412,7 +439,7 @@ function failure(error: unknown): CallToolResult {
 	} else if (!(error instanceof OaiImageError)) {
 		message = `Unexpected error: ${message}`;
 	}
-	return { isError: true, content: [{ type: "text", text: message }] };
+	return { isError: true, content: [{ type: "text", text: message }], structuredContent: { ...errorReport(error), message } };
 }
 
 function text(value: string): CallToolResult {

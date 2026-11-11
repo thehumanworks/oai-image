@@ -8,7 +8,17 @@ import {
 	ProtocolError,
 } from "@modelcontextprotocol/server";
 import * as z from "zod";
+import { type ImageWarning, sizingJson } from "../client.ts";
 import { DEFAULT_IMAGE_MODEL, MAX_INPUT_IMAGES, PACKAGE_NAME, PACKAGE_VERSION } from "../constants.ts";
+import type { ErrorReport } from "../errors.ts";
+import {
+	QUALITY_DESCRIPTION,
+	RATIO_DESCRIPTION,
+	RATIO_PATTERN,
+	SIZE_DESCRIPTION,
+	SIZE_PATTERN,
+	SIZING_INSTRUCTIONS,
+} from "../tool-text.ts";
 import { type Env, type GrantProps, publicOrigin, vaultStub } from "./env.ts";
 import { signedImageUrl } from "./images.ts";
 import type { Job, JobRequest, VaultResult } from "./vault.ts";
@@ -27,7 +37,9 @@ const POLL_INTERVAL_MS = 3000;
 
 const INSTRUCTIONS = `Generates and edits images with OpenAI's image models, billed to the signed-in user's own ChatGPT plan.
 A render usually takes 20 seconds to 2 minutes. Clients that support the MCP Tasks extension get a task to poll; others can pass run_in_background and check get_image_job.
-Results include a download link valid for 24 hours, and the image inline when it is small enough.`;
+Results include a download link valid for 24 hours, and the image inline when it is small enough.
+${SIZING_INSTRUCTIONS}
+Images for one account render one at a time; further calls wait in a queue of up to 4 and say so in their status.`;
 
 /** Everything a tool call needs about its caller, taken from the verified grant. */
 export interface Caller {
@@ -40,10 +52,11 @@ export interface Caller {
 const shared = {
 	size: z
 		.string()
+		.regex(SIZE_PATTERN, 'Use "auto", a preset name, or WIDTHxHEIGHT such as 1536x1024')
 		.optional()
-		.describe('Canvas: "auto" (default), WIDTHxHEIGHT such as "1536x1024", or "square", "landscape", "portrait", "2k", "4k".'),
-	aspect_ratio: z.string().optional().describe('Aspect ratio such as "16:9", instead of size.'),
-	quality: z.enum(["auto", "low", "medium", "high"]).optional().describe("Rendering quality. Higher is slower and uses more of the plan's limit."),
+		.describe(SIZE_DESCRIPTION),
+	aspect_ratio: z.string().regex(RATIO_PATTERN, "Use WIDTH:HEIGHT, such as 16:9").optional().describe(RATIO_DESCRIPTION),
+	quality: z.enum(["auto", "low", "medium", "high"]).optional().describe(QUALITY_DESCRIPTION),
 	background: z
 		.enum(["auto", "opaque", "transparent"])
 		.optional()
@@ -218,6 +231,7 @@ export function createServer(env: Env, origin: string, caller: Caller): McpServe
 				job_id: z.string().min(1).describe("The job id returned when the job was started."),
 				wait_seconds: z.number().int().min(0).max(50).optional().describe("Wait this long for the job to finish. Default 20."),
 			}),
+			outputSchema: jobOutputSchema,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		async (args, ctx) => {
@@ -229,8 +243,13 @@ export function createServer(env: Env, origin: string, caller: Caller): McpServe
 				if (job.status !== "working") return jobResult(env, origin, job);
 				if (Date.now() + POLL_INTERVAL_MS > deadline || signal.aborted) {
 					return {
-						content: [{ type: "text", text: `Still rendering (job ${job.id}, started ${job.createdAt}). Check again shortly.` }],
-						structuredContent: { job_id: job.id, status: job.status },
+						content: [
+							{
+								type: "text",
+								text: `Still working (job ${job.id}, started ${job.createdAt}): ${job.statusMessage ?? "rendering"} Check again shortly.`,
+							},
+						],
+						structuredContent: { job_id: job.id, status: job.status, ...(job.statusMessage ? { status_message: job.statusMessage } : {}) },
 					};
 				}
 				await sleep(POLL_INTERVAL_MS, signal);
@@ -360,6 +379,42 @@ export function taskView(job: Job) {
 	};
 }
 
+/**
+ * `structuredContent` of `get_image_job`: a job still running, or a finished one.
+ *
+ * `generate_image` and `edit_image` declare no output schema because a call
+ * answered with a task handle carries no structured content, which the SDK
+ * would reject; their finished results have this same shape.
+ */
+const jobOutputSchema = z.object({
+	job_id: z.string(),
+	status: z.enum(["working", "completed", "cancelled"]).optional(),
+	status_message: z.string().optional(),
+	operation: z.enum(["generate", "edit"]).optional(),
+	model: z.string().optional(),
+	images: z
+		.array(
+			z.object({
+				url: z.string(),
+				mime_type: z.string(),
+				width: z.number().optional(),
+				height: z.number().optional(),
+				bytes: z.number(),
+			}),
+		)
+		.optional(),
+	sizing: z
+		.object({
+			requested: z.object({ size: z.string().optional(), aspect_ratio: z.string().optional() }),
+			sent: z.object({ size: z.string(), kind: z.string(), hint: z.string().optional() }),
+			actual: z.object({ width: z.number(), height: z.number(), ratio: z.number(), megapixels: z.number() }).optional(),
+			backend_size: z.string().optional(),
+		})
+		.optional(),
+	warnings: z.array(z.object({ code: z.string(), message: z.string() })).optional(),
+	request_id: z.string().optional(),
+});
+
 /** The tool result for a finished job: links, small images inline, and structured content. */
 export async function jobResult(env: Env, origin: string, job: Job): Promise<CallToolResult> {
 	if (job.status === "cancelled") return failure(new ToolFailure("The job was cancelled.", "cancelled"));
@@ -370,7 +425,19 @@ export async function jobResult(env: Env, origin: string, job: Job): Promise<Cal
 		if (outcome.code === "usage_limit") {
 			message += `${outcome.resetsAt ? ` The limit resets at ${outcome.resetsAt}.` : ""} Do not retry until the limit resets.`;
 		}
-		return { isError: true, content: [{ type: "text", text: message }], structuredContent: { error: outcome.code ?? "error", message } };
+		const report: ErrorReport = outcome.report ?? {
+			error: (outcome.code ?? "error") as ErrorReport["error"],
+			message,
+			retryable: outcome.code === "interrupted",
+		};
+		if (report.retryable && report.retry_after_seconds !== undefined) {
+			message += ` Retry in about ${report.retry_after_seconds} seconds.`;
+		}
+		return {
+			isError: true,
+			content: [{ type: "text", text: message }],
+			structuredContent: { job_id: job.id, ...report, message } as unknown as Record<string, unknown>,
+		};
 	}
 	const lines = [
 		`${outcome.operation === "edit" ? "Edited" : "Generated"} ${outcome.images.length} image${outcome.images.length === 1 ? "" : "s"} (model requested: ${outcome.model ?? "default"}).`,
@@ -398,15 +465,24 @@ export async function jobResult(env: Env, origin: string, job: Job): Promise<Cal
 			}
 		}
 	}
-	for (const warning of outcome.warnings) lines.push(`Warning: ${warning}`);
+	const warnings = outcome.warnings.map(normalizeWarning);
+	if (outcome.sizing?.actual) {
+		const { actual, requested } = outcome.sizing;
+		const asked = requested.size ?? requested.aspectRatio;
+		if (asked) lines.push(`Requested ${asked}; got ${actual.width}x${actual.height} (${actual.megapixels} MP).`);
+	}
+	for (const warning of warnings) lines.push(`Warning: ${warning.message}`);
 	return {
 		content: [{ type: "text", text: lines.join("\n") }, ...blocks],
 		structuredContent: {
 			job_id: job.id,
+			status: job.status,
 			operation: outcome.operation,
 			model: outcome.model,
 			images,
-			warnings: outcome.warnings,
+			...(outcome.sizing ? { sizing: sizingJson(outcome.sizing) } : {}),
+			warnings,
+			...(outcome.requestId ? { request_id: outcome.requestId } : {}),
 		},
 	};
 }
@@ -432,7 +508,16 @@ function failure(error: unknown): CallToolResult {
 	const message = error instanceof Error ? error.message : String(error);
 	const code = error instanceof ToolFailure ? error.code : "internal";
 	const hint = code === "auth_required" ? " Reconnect this server in your MCP client to sign in with ChatGPT again." : "";
-	return { isError: true, content: [{ type: "text", text: `${message}${hint}` }] };
+	return {
+		isError: true,
+		content: [{ type: "text", text: `${message}${hint}` }],
+		structuredContent: { error: code, message: `${message}${hint}`, retryable: false },
+	};
+}
+
+/** Jobs stored before warnings had codes hold plain strings. */
+function normalizeWarning(warning: ImageWarning | string): { code: string; message: string } {
+	return typeof warning === "string" ? { code: "note", message: warning } : warning;
 }
 
 function text(value: string): CallToolResult {

@@ -260,7 +260,24 @@ test("cli: backend failures map to exit codes and readable messages", async () =
 	respond = () => ({ json: imageResponse([pngBytes(1024, 1024)]) });
 	const warned = await run(["generate", "x", "--size", "1024x1536", "-Q"], { env });
 	assert.equal(warned.code, 0);
-	assert.match(warned.stderr, /warning: Requested 1024x1536 but the backend returned 1024x1024\./);
+	assert.match(warned.stderr, /warning: Requested a portrait image, 1024x1536, but got 1024x1024 \(1:1\)\./);
+
+	// --strict-size turns a missed size into a failure; the image is still saved.
+	respond = () => ({ json: imageResponse([pngBytes(1820, 864)]) });
+	const strict = await run(["generate", "x", "--aspect", "21:9", "--strict-size", "--json"], { env });
+	assert.equal(strict.code, 6, strict.stderr);
+	assert.match(strict.stderr, /warning: Requested 21:9 \(2\.33:1\) but got 1820x864 \(2\.11:1\)\./);
+	const described = JSON.parse(strict.stdout) as { sizing: Record<string, unknown>; warnings: Array<{ code: string }> };
+	assert.deepEqual(described.warnings.map(warning => warning.code), ["ratio_snapped"]);
+	assert.deepEqual(described.sizing.sent, { size: "1904x816", kind: "ratio", hint: "Output format: landscape image, 21:9 aspect ratio." });
+
+	// A block page from the edge: retried once, then a retryable failure with its own exit code.
+	backend.requests.length = 0;
+	respond = () => ({ status: 403, text: "<!DOCTYPE html><title>Just a moment...</title>", headers: { "cf-ray": "abc-IAD" } });
+	const blocked = await run(["generate", "x"], { env: { ...env } });
+	assert.equal(blocked.code, 5, blocked.stderr);
+	assert.match(blocked.stderr, /edge protection .*\(cf-ray abc-IAD\).*Retry in about 30s\./);
+	assert.equal(backend.requests.length, 2);
 });
 
 test("cli: --codex-auth reads and refreshes the Codex CLI's auth.json in place", async () => {

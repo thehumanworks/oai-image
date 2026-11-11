@@ -6,7 +6,17 @@ import { AuthManager, StaticTokenAuth } from "../src/auth/manager.ts";
 import { MemoryTokenStore } from "../src/auth/store.ts";
 import { OaiImage } from "../src/client.ts";
 import { CODEX_COMPAT_VERSION, PACKAGE_VERSION } from "../src/constants.ts";
-import { ApiError, AuthRequiredError, OaiImageError, ResponseError, UsageLimitError, ValidationError } from "../src/errors.ts";
+import {
+	ApiError,
+	AuthRequiredError,
+	errorReport,
+	OaiImageError,
+	RateLimitError,
+	ResponseError,
+	UpstreamBlockedError,
+	UsageLimitError,
+	ValidationError,
+} from "../src/errors.ts";
 import {
 	accessToken,
 	gifBytes,
@@ -123,7 +133,7 @@ test("generate: aspect ratio, opting out of the size hint, and per-call model", 
 		background: "opaque",
 		model: "gpt-image-2",
 		quality: "auto",
-		size: "1536x864",
+		size: "1648x928",
 	});
 });
 
@@ -184,6 +194,9 @@ test("validation happens before any request is made", async () => {
 	await assert.rejects(oai.generate({ prompt: "x", n: 0 }), ValidationError);
 	await assert.rejects(oai.generate({ prompt: "x", n: 1.5 }), ValidationError);
 	await assert.rejects(oai.generate({ prompt: "x", size: "enormous" }), ValidationError);
+	await assert.rejects(oai.generate({ prompt: "x", size: "1000x1000" }), /multiples of 16/);
+	await assert.rejects(oai.generate({ prompt: "x", size: "4096x2048" }), /long edge may be at most 3840px/);
+	await assert.rejects(oai.generate({ prompt: "x", size: "512x512" }), /between 655,360 and 8,294,400 pixels/);
 	await assert.rejects(oai.generate({ prompt: "x", background: "clear" as never }), ValidationError);
 	await assert.rejects(oai.generate({ prompt: "x", gif: { frameCount: 99 } }), ValidationError);
 	await assert.rejects(oai.generate({ prompt: "x", images: [path.join(dir, "nope.png")] }), ValidationError);
@@ -197,18 +210,64 @@ test("warnings: the result says when the backend did not do what was asked", asy
 	respond = () => ({ json: imageResponse([pngBytes(1536, 1024)], { background: "opaque" }) });
 	const exact = await oai.generate({ prompt: "x", size: "1024x1024", background: "transparent", n: 2, gif: true });
 	assert.deepEqual(exact.warnings, [
-		"Requested 1024x1024 but the backend returned 1536x1024.",
-		"Requested 2 images but the backend returned 1.",
-		"Requested a transparent background but the backend returned an opaque image.",
-		"Requested a GIF but the backend returned image/png.",
+		{ code: "shape_changed", message: "Requested a square image, 1024x1024, but got 1536x1024 (1.5:1)." },
+		{ code: "fewer_images", message: "Requested 2 images but the backend returned 1." },
+		{ code: "background_ignored", message: "Requested a transparent background but the backend returned an opaque image." },
+		{ code: "not_gif", message: "Requested a GIF but the backend returned image/png." },
 	]);
 
 	const shape = await oai.generate({ prompt: "x", aspectRatio: "9:16" });
-	assert.deepEqual(shape.warnings, ["Requested a portrait image but the backend returned 1536x1024."]);
+	assert.deepEqual(
+		shape.warnings.map(warning => warning.code),
+		["shape_changed"],
+	);
 
-	// A ratio is satisfied by any canvas of the right orientation.
+	// Within 3% of the ratio is a match.
 	respond = () => ({ json: imageResponse([pngBytes(1024, 1792)]) });
 	assert.deepEqual((await oai.generate({ prompt: "x", aspectRatio: "9:16" })).warnings, []);
+
+	// Exact pixels: the same shape but other pixels is still reported.
+	respond = () => ({ json: imageResponse([pngBytes(1536, 1040)]) });
+	assert.deepEqual((await oai.generate({ prompt: "x", size: "1536x1024" })).warnings, [
+		{ code: "size_changed", message: "Requested 1536x1024 but got 1536x1040." },
+	]);
+});
+
+test("warnings: a snapped ratio and a capped resolution are reported, with the sizing report", async () => {
+	const oai = client();
+	// What the backend returned for 21:9 in the field.
+	respond = () => ({ json: imageResponse([pngBytes(1820, 864)], { size: "1820x864" }) });
+	const wide = await oai.generate({ prompt: "x", aspectRatio: "21:9" });
+	assert.deepEqual(wide.warnings, [
+		{ code: "ratio_snapped", message: "Requested 21:9 (2.33:1) but got 1820x864 (2.11:1)." },
+	]);
+	assert.deepEqual(wide.sizing, {
+		requested: { aspectRatio: "21:9" },
+		sent: { size: "1904x816", kind: "ratio", hint: "Output format: landscape image, 21:9 aspect ratio." },
+		actual: { width: 1820, height: 864, ratio: 2.11, megapixels: 1.57 },
+		backendSize: "1820x864",
+	});
+
+	// The same through the preset.
+	assert.equal((await oai.generate({ prompt: "x", size: "ultrawide" })).warnings[0]?.code, "ratio_snapped");
+
+	respond = () => ({ json: imageResponse([pngBytes(1536, 1024)]) });
+	const big = await oai.generate({ prompt: "x", size: "4k" });
+	assert.deepEqual(big.warnings, [
+		{ code: "ratio_snapped", message: "Requested 4k, 3840x2160 (1.78:1) but got 1536x1024 (1.5:1)." },
+		{
+			code: "size_reduced",
+			message:
+				"Requested 3840x2160 (8.29 MP) but got 1536x1024 (1.57 MP). This route has not been seen to return more than about 1.57 MP.",
+		},
+	]);
+	assert.equal(JSON.parse(backend.requests.at(-1)!.body).prompt, "x\n\nOutput format: landscape image, 3840x2160 pixels.");
+
+	// Nothing asked, nothing to warn about.
+	const auto = await oai.generate("x");
+	assert.deepEqual(auto.warnings, []);
+	assert.deepEqual(auto.sizing.requested, {});
+	assert.deepEqual(auto.sizing.sent, { size: "auto", kind: "auto" });
 });
 
 test("fedramp and region-pinned workspaces get their routing headers", async () => {
@@ -280,7 +339,7 @@ test("errors: usage limit carries the reset time, plan and limit id", async () =
 });
 
 test("errors: backend messages are passed on verbatim in every body shape", async () => {
-	const oai = client();
+	const oai = client({ blockedRetryDelayMs: 0 });
 	const cases: Array<[Reply, RegExp, Partial<ApiError>]> = [
 		[
 			{ status: 400, json: { detail: "GIF output is not enabled for this request." } },
@@ -298,11 +357,12 @@ test("errors: backend messages are passed on verbatim in every body shape", asyn
 		],
 		[{ status: 429, json: { error: { type: "usage_not_included" } } }, /plan does not include/, { status: 429 }],
 		[
-			{ status: 403, text: "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>" },
-			/HTTP 403\): the server returned an HTML page titled "Just a moment\.\.\."/,
-			{ status: 403 },
+			{ status: 403, json: { detail: "Forbidden" }, headers: { "x-request-id": "req-9" } },
+			/HTTP 403\): Forbidden \(request req-9\)/,
+			{ status: 403, retryable: false, requestId: "req-9" },
 		],
-		[{ status: 500, text: "" }, /HTTP 500\)/, { status: 500 }],
+		[{ status: 500, text: "" }, /HTTP 500\)/, { status: 500, retryable: false }],
+		[{ status: 503, text: "busy" }, /HTTP 503\): busy/, { status: 503, retryable: true }],
 	];
 	for (const [reply, message, fields] of cases) {
 		respond = () => reply;
@@ -313,6 +373,61 @@ test("errors: backend messages are passed on verbatim in every body shape", asyn
 			return true;
 		});
 	}
+});
+
+test("errors: a block page from the edge is retried once, then reported as retryable", async () => {
+	const oai = client({ blockedRetryDelayMs: 0 });
+	const page = "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>";
+	respond = () => ({
+		status: 403,
+		text: page,
+		headers: { "content-type": "text/html", "cf-ray": "8f00-IAD", "cf-mitigated": "challenge" },
+	});
+	await assert.rejects(oai.generate("x"), (error: unknown) => {
+		assert.ok(error instanceof UpstreamBlockedError, String(error));
+		assert.equal(error.status, 403);
+		assert.equal(error.retryable, true);
+		assert.equal(error.retryAfterMs, 30_000);
+		assert.equal(error.cfRay, "8f00-IAD");
+		assert.equal(error.cfMitigated, "challenge");
+		assert.match(error.message, /bot challenge titled "Just a moment\.\.\." \(HTTP 403\) instead of the image API \(cf-ray 8f00-IAD\)/);
+		assert.deepEqual(errorReport(error), {
+			error: "upstream_blocked",
+			message: error.message,
+			retryable: true,
+			retry_after_seconds: 30,
+			status: 403,
+			cf_ray: "8f00-IAD",
+		});
+		return true;
+	});
+	assert.equal(backend.requests.length, 2);
+
+	// A block that clears on the retry is invisible to the caller.
+	backend.requests.length = 0;
+	let calls = 0;
+	respond = () => (++calls === 1 ? { status: 403, text: page } : { json: imageResponse() });
+	assert.equal((await oai.generate("x")).images.length, 1);
+	assert.equal(backend.requests.length, 2);
+
+	// Opting out sends the request once.
+	const once = client({ retryBlocked: false });
+	respond = () => ({ status: 403, text: page });
+	await assert.rejects(once.generate("x"), UpstreamBlockedError);
+	assert.equal(backend.requests.length, 1);
+});
+
+test("errors: a 429 that is not the plan limit is a retryable RateLimitError", async () => {
+	const oai = client();
+	respond = () => ({ status: 429, json: { error: { message: "Slow down" } }, headers: { "retry-after": "12" } });
+	await assert.rejects(oai.generate("x"), (error: unknown) => {
+		assert.ok(error instanceof RateLimitError, String(error));
+		assert.equal(error.retryable, true);
+		assert.equal(error.retryAfterMs, 12_000);
+		assert.match(error.message, /Too many image requests in a short time \(HTTP 429\): Slow down\. Wait and retry\./);
+		return true;
+	});
+	assert.equal(backend.requests.length, 1);
 });
 
 test("errors: a 2xx without usable image data is a ResponseError", async () => {

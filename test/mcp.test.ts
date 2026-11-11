@@ -115,12 +115,18 @@ test("mcp: generate_image saves the file and returns path, metadata and the imag
 		arguments: { prompt: "a lighthouse at dusk", size: "portrait", quality: "low", filename: "../escape/Light House.png" },
 	});
 	assert.notEqual(result.isError, true, textOf(result));
-	const structured = result.structuredContent as { images: Array<Record<string, unknown>>; model: string; operation: string; warnings: string[] };
+	const structured = result.structuredContent as { images: Array<Record<string, unknown>>; model: string; operation: string; warnings: unknown[]; sizing: unknown };
 	const expectedPath = path.join(dir, "out", "Light-House.png");
 	assert.deepEqual(structured, {
 		images: [{ path: expectedPath, mime_type: "image/png", width: 1024, height: 1536, bytes: pngBytes().length }],
 		operation: "generate",
 		model: "gpt-image-2.6-sunburst",
+		sizing: {
+			requested: { size: "portrait" },
+			sent: { size: "1024x1536", kind: "preset", hint: "Output format: portrait image, 2:3 aspect ratio." },
+			actual: { width: 1024, height: 1536, ratio: 0.67, megapixels: 1.57 },
+			backend_size: "1024x1024",
+		},
 		warnings: [],
 	});
 	assert.deepEqual(await fs.readFile(expectedPath), pngBytes(1024, 1536));
@@ -193,6 +199,20 @@ test("mcp: failures come back as tool errors the model can act on", async () => 
 	const limited = await mcp.callTool({ name: "generate_image", arguments: { prompt: "x" } });
 	assert.equal(limited.isError, true);
 	assert.match(textOf(limited), /usage limit reached \(plus plan\).*Do not retry until the limit resets/s);
+	assert.equal((limited.structuredContent as { error: string; retryable: boolean }).error, "usage_limit");
+	assert.equal((limited.structuredContent as { retryable: boolean }).retryable, false);
+
+	respond = () => ({ status: 429, json: { error: { message: "Slow down" } }, headers: { "retry-after": "20", "x-request-id": "req-3" } });
+	const throttled = await mcp.callTool({ name: "generate_image", arguments: { prompt: "x" } });
+	assert.equal(throttled.isError, true);
+	assert.deepEqual(throttled.structuredContent, {
+		error: "rate_limited",
+		message: textOf(throttled),
+		retryable: true,
+		retry_after_seconds: 20,
+		status: 429,
+		request_id: "req-3",
+	});
 
 	respond = () => ({ status: 400, json: { error: { message: "Your request was rejected by the safety system." } } });
 	const blocked = await mcp.callTool({ name: "generate_image", arguments: { prompt: "x" } });
@@ -203,6 +223,10 @@ test("mcp: failures come back as tool errors the model can act on", async () => 
 	backend.requests.length = 0;
 	const invalid = await mcp.callTool({ name: "generate_image", arguments: { prompt: "x", quality: "ultra" } }).catch(error => error);
 	assert.ok(invalid instanceof Error || invalid.isError === true);
+	for (const args of [{ size: "huge" }, { aspect_ratio: "wide" }, { size: "1000x1000" }]) {
+		const bad = await mcp.callTool({ name: "generate_image", arguments: { prompt: "x", ...args } }).catch(error => error);
+		assert.ok(bad instanceof Error || bad.isError === true, JSON.stringify(args));
+	}
 	assert.equal(backend.requests.length, 0);
 	await close();
 });

@@ -16,7 +16,7 @@ import * as net from "node:net";
 import { after, before, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { accessToken, imageResponse, makeJwt, type MockServer, mockServer, pngBytes, tempDir } from "./helpers.ts";
+import { accessToken, imageResponse, makeJwt, type MockServer, mockServer, pngBytes, type Reply, tempDir } from "./helpers.ts";
 
 const enabled = process.env.OAI_IMAGE_REMOTE_TESTS === "1";
 const PROTOCOL = "2026-07-28";
@@ -31,6 +31,10 @@ let persistDir = "";
 let approve = false;
 let nextIdentity = { email: "first@example.com", userId: "user-first", accountId: "acct-first", expiresIn: 3600 };
 let renderDelayMs = 1500;
+/** Replaces the backend's image answer when set. */
+let backendOverride: (() => Reply) | undefined;
+let inFlight = 0;
+let maxInFlight = 0;
 let refreshFails = false;
 
 before(async () => {
@@ -67,9 +71,16 @@ before(async () => {
 		return { status: 404, text: "not found" };
 	});
 	backend = await mockServer(async request => {
-		await new Promise(resolve => setTimeout(resolve, renderDelayMs));
-		const size = request.json?.size === "1536x1024" ? [1536, 1024] : [1024, 1024];
-		return { json: imageResponse([pngBytes(size[0], size[1])]) };
+		inFlight++;
+		maxInFlight = Math.max(maxInFlight, inFlight);
+		try {
+			await new Promise(resolve => setTimeout(resolve, renderDelayMs));
+			if (backendOverride) return backendOverride();
+			const size = request.json?.size === "1536x1024" ? [1536, 1024] : [1024, 1024];
+			return { json: imageResponse([pngBytes(size[0], size[1])]) };
+		} finally {
+			inFlight--;
+		}
 	});
 	persistDir = await tempDir("oai-image-remote-");
 	const port = await freePort();
@@ -435,6 +446,62 @@ test("remote: run_in_background returns a job id that get_image_job resolves", {
 	assert.ok(jobId);
 	const fetched = await rpc(first.accessToken, "tools/call", { name: "get_image_job", arguments: { job_id: jobId, wait_seconds: 30 } }, { tasks: false });
 	assert.match(fetched.result.content[0].text, /Generated 1 image/);
+});
+
+test("remote: one account's images render one at a time, the rest queue", { skip: !enabled }, async () => {
+	renderDelayMs = 1200;
+	maxInFlight = 0;
+	const start = () =>
+		rpc(
+			first.accessToken,
+			"tools/call",
+			{ name: "generate_image", arguments: { prompt: "a boat", size: "landscape", run_in_background: true } },
+			{ tasks: false },
+		);
+	const a = (await start()).result.structuredContent.job_id;
+	const b = (await start()).result.structuredContent.job_id;
+	const waiting = await rpc(first.accessToken, "tools/call", { name: "get_image_job", arguments: { job_id: b, wait_seconds: 0 } }, { tasks: false });
+	assert.equal(waiting.result.structuredContent.status, "working");
+	assert.match(waiting.result.structuredContent.status_message, /Queued behind 1 other image/);
+
+	for (const id of [a, b]) {
+		const done = await rpc(first.accessToken, "tools/call", { name: "get_image_job", arguments: { job_id: id, wait_seconds: 30 } }, { tasks: false });
+		const structured = done.result.structuredContent;
+		assert.equal(structured.status, "completed", JSON.stringify(done));
+		assert.deepEqual(structured.sizing.requested, { size: "landscape" });
+		assert.deepEqual(structured.sizing.actual, { width: 1536, height: 1024, ratio: 1.5, megapixels: 1.57 });
+		assert.deepEqual(structured.warnings, []);
+	}
+	assert.equal(maxInFlight, 1);
+});
+
+test("remote: an edge block page comes back as a structured, retryable error", { skip: !enabled }, async () => {
+	renderDelayMs = 0;
+	backendOverride = () => ({
+		status: 403,
+		text: "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>",
+		headers: { "content-type": "text/html", "cf-mitigated": "challenge", "cf-ray": "77aa-IAD" },
+	});
+	try {
+		const started = await rpc(
+			first.accessToken,
+			"tools/call",
+			{ name: "generate_image", arguments: { prompt: "a boat", run_in_background: true } },
+			{ tasks: false },
+		);
+		const jobId = started.result.structuredContent.job_id;
+		const failed = await rpc(first.accessToken, "tools/call", { name: "get_image_job", arguments: { job_id: jobId, wait_seconds: 30 } }, { tasks: false });
+		assert.equal(failed.result.isError, true);
+		const structured = failed.result.structuredContent;
+		assert.equal(structured.error, "upstream_blocked");
+		assert.equal(structured.retryable, true);
+		assert.equal(structured.retry_after_seconds, 30);
+		assert.equal(structured.status, 403);
+		assert.equal(structured.cf_ray, "77aa-IAD");
+		assert.match(failed.result.content[0].text, /bot challenge .*Retry in about 30 seconds/);
+	} finally {
+		backendOverride = undefined;
+	}
 });
 
 test("remote: tasks/cancel stops a render", { skip: !enabled }, async () => {

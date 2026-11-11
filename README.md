@@ -127,8 +127,9 @@ Saved file paths are printed to stdout, one per line; progress and warnings go t
 | `-o, --output <file>` | Save to this file. `-` writes the image to stdout. |
 | `-d, --out-dir <dir>` | Directory for auto-named files. Default: current directory, or `OAI_IMAGE_OUTPUT_DIR`. |
 | `-m, --model <id>` | Model id or alias. Default `gpt-image-2.6-sunburst`, or `OAI_IMAGE_MODEL`. |
-| `-s, --size <size>` | `auto`, `WIDTHxHEIGHT`, `square`, `landscape`, `portrait`, `2k`, `4k`. |
-| `-a, --aspect <w:h>` | Aspect ratio such as `16:9`, instead of `--size`. |
+| `-s, --size <size>` | `auto`, `WIDTHxHEIGHT`, or a preset (see [About sizes](#about-sizes)). |
+| `-a, --aspect <w:h>` | Aspect ratio from `1:3` to `3:1`, such as `16:9` or `9:19.5`, instead of `--size`. |
+| `--strict-size` | Exit with `6` when the image is not the size or ratio asked for. The image is still saved. |
 | `-q, --quality <level>` | `auto`, `low`, `medium`, `high`. |
 | `-b, --background <kind>` | `opaque` (default), `transparent`, `auto`. `--transparent` is a shortcut. |
 | `-n, --count <n>` | Number of images, 1–10. |
@@ -137,16 +138,39 @@ Saved file paths are printed to stdout, one per line; progress and warnings go t
 | `--no-size-hint` | Do not also state the requested size in the prompt (see below). |
 | `--extra key=value` | Extra request field, e.g. `--extra moderation=low`. Value is parsed as JSON when possible. |
 | `--json` | Print a JSON description of the result instead of paths. |
-| `--timeout <s>`, `--retries <n>` | Default 600 seconds and 0 retries. Under Node.js the built-in fetch gives up after 300 seconds without a response, whatever `--timeout` says; the standalone binary waits the full time. |
+| `--timeout <s>`, `--retries <n>` | Default 600 seconds and 0 retries of network errors and 502/503/504. Under Node.js the built-in fetch gives up after 300 seconds without a response, whatever `--timeout` says; the standalone binary waits the full time. |
 | `--codex-auth` | Use the Codex CLI's login instead of this package's own. |
 
-Exit codes: `0` success, `1` failure, `2` bad usage, `3` not signed in, `4` plan usage limit reached.
+Exit codes: `0` success, `1` failure, `2` bad usage, `3` not signed in, `4` plan usage limit reached, `5` a retryable failure (blocked by ChatGPT's edge protection, rate limited, or a 502/503/504), `6` the image missed the requested size with `--strict-size`.
 
 Run `oai-image models` for the known model ids and aliases.
 
 ### About sizes
 
-OpenAI's [Codex image guide](https://learn.chatgpt.com/docs/image-generation) says to describe framing and dimensions in the prompt, and users report the backend disregards the `size` field. So a requested size or aspect ratio is sent both ways: in `size`, and as a sentence appended to the prompt (`Output format: landscape image, 16:9 aspect ratio.`). Whether the sentence is enough to get the canvas you asked for has not been measured on this route. Turn it off with `--no-size-hint` (`sizeHint: false` in the SDK). The actual dimensions are read from the returned image, and you get a warning if they differ from what you asked for.
+A size is a request, not a guarantee. On this route the backend picks the canvas itself, mostly from the prompt. Every successful image seen so far has been about 1.57 megapixels (1536x1024, 1820x864, 1024x1536) at every quality, so `quality` changes detail, not resolution, and `2k`, `4k` and large custom sizes come back smaller.
+
+| Value | Sent as | Notes |
+| --- | --- | --- |
+| `square`, `landscape`, `portrait` | 1024x1024, 1536x1024, 1024x1536 | The backend's own canvases. |
+| `phone`, `ultrawide`, `widescreen`, `story` | 9:19.5, 21:9, 16:9, 9:16 | Resolved like `--aspect`. |
+| `--aspect W:H` | e.g. 21:9 → 1904x816 | The multiple-of-16 canvas closest to the ratio within 1.57 MP. 1:3 to 3:1. |
+| `2k`, `4k` | 2048x2048, 3840x2160 | Not seen to be honoured; expect a `size_reduced` warning. |
+| `WIDTHxHEIGHT` | as given | Both edges multiples of 16, long edge at most 3840, ratio at most 3:1, 655,360 to 8,294,400 pixels. Anything else is rejected before a request is made. |
+
+A requested size or ratio is sent both in `size` and as a sentence appended to the prompt (`Output format: landscape image, 21:9 aspect ratio.`), since OpenAI's [Codex image guide](https://learn.chatgpt.com/docs/image-generation) says to describe framing in the prompt. Turn the sentence off with `--no-size-hint` (`sizeHint: false` in the SDK).
+
+Every result reports `sizing`: what was requested, what was sent, the actual dimensions read from the image, and the backend's own `size` field. When they differ you get a warning with a code:
+
+| Code | When |
+| --- | --- |
+| `shape_changed` | Portrait, landscape or square is not what was asked. |
+| `ratio_snapped` | Same shape, but the ratio is more than 3% off (21:9 asked, 1820x864 returned). |
+| `size_reduced` | Fewer than 80% of the requested pixels. |
+| `size_changed` | Exact pixels were asked and others came back. |
+
+### About errors and parallel calls
+
+When ChatGPT's Cloudflare edge answers with a block or challenge page instead of the API, the request is retried once after 3 seconds, then fails with `UpstreamBlockedError` (`upstream_blocked` in tool results), which is marked retryable and carries the `cf-ray` and request ids. Such a request most likely never reached the image model. Running several images at once from one account makes blocks more likely, so the hosted server renders one image per account at a time and queues the rest.
 
 ### About backgrounds
 
@@ -177,7 +201,9 @@ const edited = await client.edit({
 await edited.images[0].save("product-cutout.png");
 ```
 
-Each `GeneratedImage` has `bytes`, `base64`, `mimeType`, `extension`, `width`, `height`, `toDataUrl()` and `save(file)`. The result also carries `warnings`, `usage`, the request ids, and `raw` (the response minus image data).
+Each `GeneratedImage` has `bytes`, `base64`, `mimeType`, `extension`, `width`, `height`, `toDataUrl()` and `save(file)`. The result also carries `sizing` (requested, sent and actual canvas), `warnings` (`{ code, message }`), `usage`, the request ids, and `raw` (the response minus image data).
+
+Sizes are typed: `size` takes `"auto" | SizePreset | \`${number}x${number}\`` and `aspectRatio` takes `\`${number}:${number}\``, with the presets and common ratios (`"16:9"`, `"21:9"`, `"9:19.5"`, …) offered for autocompletion. Values are still checked at runtime, since the types also admit `"0:9"`.
 
 Signing in from code:
 
@@ -192,9 +218,9 @@ await login.wait();                             // tokens are saved when this re
 
 Bring your own credentials by passing `auth`: `new StaticTokenAuth(accessToken)` for a fixed token, `new AuthManager({ store })` with your own `TokenStore` (keychain, secret manager), or any object with a `getAuth()` method.
 
-Errors are typed: `AuthRequiredError` (sign in again), `UsageLimitError` (with `resetsAt`), `ApiError` (with `status`, `code`, `requestId`), `ValidationError`, `ResponseError`, `LoginError`. All extend `OaiImageError`. Backend error messages are passed through verbatim.
+Errors are typed: `AuthRequiredError` (sign in again), `UsageLimitError` (with `resetsAt`), `UpstreamBlockedError` (an edge block page), `RateLimitError` (a 429 that is not the plan limit), `ApiError` (with `status`, `code`, `requestId`, `cfRay`, `retryable`, `retryAfterMs`), `ValidationError`, `ResponseError`, `LoginError`. All extend `OaiImageError`. Backend error messages are passed through verbatim. `errorReport(error)` turns any of them into the JSON the MCP servers return: `{ error, message, retryable, retry_after_seconds, status, request_id, cf_ray }`.
 
-Nothing is retried unless you set `maxRetries`, because a failed call may still have used quota. The one exception is a single refresh-and-retry when the backend answers 401.
+Nothing is retried unless you set `maxRetries`, because a failed call may still have used quota. The exceptions are a single refresh-and-retry when the backend answers 401, and a single retry after an edge block page (`retryBlocked: false` turns that off).
 
 ## MCP server
 
@@ -233,7 +259,7 @@ Tools:
 | `auth_status` | Who is signed in, or how to sign in. |
 | `login` | Starts a device-code (default) or browser sign-in and returns the link and code for the user. |
 
-Images are written to disk and the path is returned, along with the image inline when it is under 3 MiB (`OAI_IMAGE_MCP_INLINE_MAX_BYTES`, `0` to never inline). That cap keeps the base64 under the 5 MB per-image limit of the strictest Claude platform; it has not been tried against a real client with full-size images, so lower it if your client rejects large tool results. Files go to `output_dir`, else `OAI_IMAGE_OUTPUT_DIR`, else `./generated_images`, else `~/oai-image` when the working directory is not writable. Existing files are never overwritten. Progress notifications are sent while an image renders, since that often takes longer than a client's default tool timeout.
+Images are written to disk and the path is returned, along with the image inline when it is under 3 MiB (`OAI_IMAGE_MCP_INLINE_MAX_BYTES`, `0` to never inline). That cap keeps the base64 under the 5 MB per-image limit of the strictest Claude platform; it has not been tried against a real client with full-size images, so lower it if your client rejects large tool results. Files go to `output_dir`, else `OAI_IMAGE_OUTPUT_DIR`, else `./generated_images`, else `~/oai-image` when the working directory is not writable. Existing files are never overwritten. Progress notifications are sent while an image renders, since that often takes longer than a client's default tool timeout. Results include `sizing` and coded `warnings` as in the SDK; failures include `structuredContent` with an `error` code and a `retryable` flag.
 
 Sign in once with `oai-image login` in a terminal before using the server, or let the model call `login` and follow the link it gives you.
 
