@@ -33,6 +33,55 @@ npm install        # also builds dist/
 npm link           # puts `oai-image` and `oai-image-mcp` on your PATH
 ```
 
+### Nix
+
+The repo is a flake. It builds the Node package (on `nodejs_24`), runs the test suite during the build, and installs both `oai-image` and `oai-image-mcp`.
+
+Try it without installing:
+
+```sh
+nix run github:thehumanworks/oai-image -- login
+nix run github:thehumanworks/oai-image#mcp     # the MCP server on stdio
+```
+
+Add it as an input to your flake:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    oai-image.url = "github:thehumanworks/oai-image";
+    oai-image.inputs.nixpkgs.follows = "nixpkgs";
+  };
+}
+```
+
+Then use the package wherever you list packages, for example in Home Manager, NixOS or a dev shell:
+
+```nix
+home.packages = [ inputs.oai-image.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+# environment.systemPackages = [ ... ];        NixOS
+# devShells.default = pkgs.mkShell { packages = [ ... ]; };
+```
+
+Or apply the overlay and refer to `pkgs.oai-image`:
+
+```nix
+nixpkgs.overlays = [ inputs.oai-image.overlays.default ];
+home.packages = [ pkgs.oai-image ];
+```
+
+Or use the Home Manager module:
+
+```nix
+imports = [ inputs.oai-image.homeManagerModules.default ];
+programs.oai-image.enable = true;
+```
+
+Once installed, register the MCP server as shown in [MCP server](#mcp-server); `oai-image mcp` and `oai-image-mcp` are both on your `PATH`. If your MCP client does not inherit your shell's `PATH`, point it at the store path instead, e.g. `"${pkgs.oai-image}/bin/oai-image-mcp"`.
+
+The Nix build leaves out the `bun` dev dependency, so `npm run build:binary` is not part of it. Use `nix develop` for a shell with Node 24 and Bun. After changing `package-lock.json`, update `npmDepsHash` in `nix/package.nix` (set it to an empty string, run `nix build`, and copy the hash from the error).
+
 ### Standalone binary
 
 To run it without Node.js, compile the CLI into a single executable with [Bun](https://bun.sh). The MCP server is inside the same file.
