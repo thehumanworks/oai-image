@@ -29,7 +29,7 @@ export const MAX_INPUT_IMAGE_BYTES = 50 * 1024 * 1024;
 
 export async function toImageReference(input: ImageInput): Promise<ImageReference> {
 	if (input instanceof URL) {
-		if (input.protocol === "file:") return fromFile(fileURLToPath(input));
+		if (input.protocol === "file:") return fromFile(fileURLToPath(input.href));
 		return toImageReference(input.href);
 	}
 	if (typeof input === "string") {

@@ -1,0 +1,41 @@
+// Cloudflare Workers deployment of the oai-image remote MCP server.
+// See docs/REMOTE.md for the one-time setup (KV namespace, R2 bucket, secret).
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "oai-image",
+	"main": "src/remote/worker.ts",
+	"compatibility_date": "2026-11-01",
+	"compatibility_flags": [
+		"nodejs_compat",
+		// Required by the OAuth provider to fetch Client ID Metadata Documents safely.
+		"global_fetch_strictly_public"
+	],
+	"workers_dev": true,
+	"vars": {
+		// Set to your custom domain's origin if you use one, e.g. "https://images.example.com".
+		// Empty means: use the origin of each request.
+		"PUBLIC_URL": ""
+	},
+	"kv_namespaces": [
+		// Created on first deploy if no id is given.
+		{ "binding": "OAUTH_KV" }
+	],
+	"r2_buckets": [
+		{ "binding": "IMAGES", "bucket_name": "oai-image-images" }
+	],
+	"durable_objects": {
+		"bindings": [{ "name": "VAULT", "class_name": "Vault" }]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["Vault"] }],
+	"observability": { "enabled": true },
+	"env": {
+		// Local end-to-end tests only (test/remote.test.ts): talks to mock OpenAI servers on loopback.
+		"test": {
+			"compatibility_flags": ["nodejs_compat"],
+			"vars": { "PUBLIC_URL": "" },
+			"kv_namespaces": [{ "binding": "OAUTH_KV", "id": "test-oauth-kv" }],
+			"r2_buckets": [{ "binding": "IMAGES", "bucket_name": "oai-image-test" }],
+			"durable_objects": { "bindings": [{ "name": "VAULT", "class_name": "Vault" }] }
+		}
+	}
+}
