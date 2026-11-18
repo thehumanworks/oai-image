@@ -169,6 +169,10 @@ async function pollDevice(request: Request, env: Env): Promise<Response> {
 		metadata: {},
 		scope: pending.request.scope.length > 0 ? pending.request.scope : [SCOPE],
 		props,
+		// The default revokes this user's other grants for the same client. Apps
+		// that share one client id across devices and sessions would then sign
+		// each other out with every new sign-in.
+		revokeExistingGrants: false,
 	});
 	await deletePending(env, secret);
 	const clear = `${DEVICE_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
@@ -240,7 +244,7 @@ function consentBody(details: ConsentDescription, handle: string): string {
 ${details.redirectIsLoopback ? "<p class=\"warn\"><strong>This sends access to an app on your computer.</strong> Continue only if you just started connecting from it.</p>" : ""}
 <ul>
   <li>Images count against your ChatGPT plan's usage limits.</li>
-  <li>Your ChatGPT sign-in is stored encrypted, and only this connection can unlock it. Nobody else using this server can use it.</li>
+  <li>Your ChatGPT sign-in is stored encrypted and used only for this connection. The server renews it in the background so you stay signed in. Nobody else using this server can use it.</li>
   <li>You can sign out at any time with the <code>sign_out</code> tool, which also revokes the sign-in at OpenAI.</li>
 </ul>
 <form method="post">

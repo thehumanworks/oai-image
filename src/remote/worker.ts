@@ -17,12 +17,20 @@ export { Vault } from "./vault.ts";
  * - `/images/*`: signed, expiring download links for generated images.
  */
 
-const ONE_HOUR = 60 * 60;
+const ONE_DAY = 24 * 60 * 60;
+/**
+ * MCP access tokens. Long-lived on purpose: every refresh is a chance for a
+ * client to lose its sign-in (a lost response, two processes refreshing at
+ * once, a session that was handed an access token and no way to renew it),
+ * and a signed-out user has to go through the ChatGPT device code again.
+ * `sign_out` and revoking the grant end a token at once, whatever its age.
+ */
+const ACCESS_TOKEN_TTL = 30 * ONE_DAY;
 /**
  * MCP refresh tokens: a grant lives as long as it is used at least once a
  * year, so users never have to sign in again while they keep using it.
  */
-const ONE_YEAR = 365 * 24 * ONE_HOUR;
+const ONE_YEAR = 365 * ONE_DAY;
 
 const mcpHandler = {
 	async fetch(request: Request, env: Env, ctx: OAuthResourceContext<GrantProps>): Promise<Response> {
@@ -78,7 +86,7 @@ function providerFor(origin: string): OAuthProvider<Env> {
 				bearer_methods_supported: ["header"],
 				resource_name: `${PACKAGE_NAME} (ChatGPT image generation)`,
 			},
-			accessTokenTTL: ONE_HOUR,
+			accessTokenTTL: ACCESS_TOKEN_TTL,
 			refreshTokenTTL: ONE_YEAR,
 			// Each refresh extends the grant, so an active connection never expires.
 			refreshTokenIdleTTL: ONE_YEAR,
@@ -90,9 +98,10 @@ function providerFor(origin: string): OAuthProvider<Env> {
 }
 
 /**
- * Each time the MCP client refreshes its token (about hourly while it is in
- * use), refresh the ChatGPT sign-in too when it is due. If OpenAI has ended
- * the sign-in for good, end the grant so the client signs in again instead of
+ * Each time the MCP client refreshes its token, refresh the ChatGPT sign-in
+ * too when it is due. The vault also does this by itself on a schedule; this
+ * covers a vault that cannot (no Worker secret). If OpenAI has ended the
+ * sign-in for good, fail the refresh so the client signs in again instead of
  * failing on every call. Transient failures never block the client's refresh.
  */
 async function keepChatGptSignInAlive(options: { grantType: string; props: unknown; env: Env }): Promise<void> {

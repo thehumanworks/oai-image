@@ -270,7 +270,7 @@ The repo also deploys to Cloudflare Workers as a remote MCP server that many peo
 - streamable HTTP on the stateless MCP 2026-07-28 revision, with a fallback for 2025-era clients;
 - the MCP Tasks extension, so image generation never blocks a request;
 - OAuth 2.1 sign-in per the MCP authorization spec, with ChatGPT's device-code login behind it;
-- each user's ChatGPT tokens encrypted with a key only their own connection holds.
+- each user's ChatGPT tokens encrypted with a key of their own connection, and refreshed in the background so users stay signed in.
 
 ```sh
 npx wrangler login

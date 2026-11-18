@@ -1,23 +1,31 @@
 import { DurableObject } from "cloudflare:workers";
-import { readIdentity, jwtExpiresAt } from "../auth/jwt.ts";
+import { readIdentity } from "../auth/jwt.ts";
 import type { ResolvedAuth } from "../auth/manager.ts";
 import { refreshTokens, resolveOAuthConfig, revokeTokens } from "../auth/oauth.ts";
 import type { StoredTokens } from "../auth/store.ts";
 import { type GenerateOptions, type ImageWarning, OaiImage, type SizingReport } from "../client.ts";
-import { REFRESH_INTERVAL_MS, REFRESH_WINDOW_MS } from "../constants.ts";
 import { AuthRequiredError, type ErrorReport, errorCode, errorReport, OaiImageError, UsageLimitError } from "../errors.ts";
-import { randomToken, type Sealed, seal, unseal } from "./crypto.ts";
+import { hmacSha256, randomToken, type Sealed, seal, unseal } from "./crypto.ts";
 import type { Env } from "./env.ts";
+import { backgroundRefreshAt, MIN_BACKGROUND_GAP_MS, needsRefresh, retryDelay } from "./schedule.ts";
 
 /**
  * A vault holds one ChatGPT sign-in and the image jobs run with it.
  *
  * There is one vault per OAuth grant, addressed by a random id. The ChatGPT
- * tokens are stored encrypted with a key that is not kept here: it lives only
- * in the grant's props, which the OAuth provider in turn encrypts with a key
- * wrapped by the grant's own access and refresh tokens. Reading this object's
- * storage, or the OAuth KV namespace, is therefore not enough to use anyone's
- * ChatGPT login; a caller needs a live token for that grant.
+ * tokens are stored encrypted with a key that lives in the grant's props,
+ * which the OAuth provider in turn encrypts with a key wrapped by the grant's
+ * own access and refresh tokens. A caller needs a live token for that grant to
+ * use the sign-in.
+ *
+ * The vault also keeps the sign-in alive by itself: its alarm refreshes the
+ * ChatGPT tokens on a schedule (see schedule.ts), whether or not the client
+ * is connected. For that it holds a second copy of the key, the "escrow",
+ * encrypted with a key derived from a Worker secret. Reading this object's
+ * storage, or the OAuth KV namespace, is still not enough to use anyone's
+ * ChatGPT login; that takes a live token for the grant, or the storage and
+ * the Worker secret together. Without the secret there is no escrow, and
+ * tokens are refreshed only when the client calls.
  *
  * Running jobs inside the object gives two things the stateless Worker lacks:
  * a single place to serialize refreshes (ChatGPT refresh tokens are
@@ -80,15 +88,20 @@ interface VaultMeta {
 	planType?: string;
 }
 
+/** The background refresh schedule. Holds no secrets. */
+interface RefreshState {
+	/** When the alarm should next refresh the ChatGPT tokens, in epoch milliseconds. */
+	dueAt: number;
+	/** Background refreshes that have failed in a row for a passing reason. */
+	failures: number;
+}
+
+/** Why a refresh was asked for: the tokens are due, the backend rejected them, or the alarm's schedule says so. */
+type RefreshReason = "due" | "rejected" | "background";
+
 export const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 /** A vault nobody has used for this long is wiped (its grant's refresh token is dead by then too). */
 export const VAULT_IDLE_MS = 400 * 24 * 60 * 60 * 1000;
-/**
- * Rotate the ChatGPT refresh token at least this often while the connection
- * is in use, even when the access token is still valid, so the sign-in never
- * goes stale at OpenAI. Codex itself refreshes after 8 days.
- */
-export const KEEP_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 /**
  * Renders sent to ChatGPT at once per sign-in. Codex never runs image calls
  * in parallel, and parallel calls from one account coincided with ChatGPT's
@@ -108,6 +121,7 @@ export class Vault extends DurableObject<Env> {
 	/** Render slots, handed out first come, first served. */
 	readonly #slots = new Slots(MAX_CONCURRENT_RENDERS);
 	#refreshing: Promise<StoredTokens> | undefined;
+	#escrowKey: Promise<string | undefined> | undefined;
 
 	/** Store a fresh sign-in. Called once, when the grant is created. */
 	async saveLogin(vaultId: string, key: string, tokens: StoredTokens): Promise<void> {
@@ -120,7 +134,8 @@ export class Vault extends DurableObject<Env> {
 			email: identity.email,
 			planType: identity.planType,
 		};
-		await this.ctx.storage.put({ meta, creds: await seal(key, JSON.stringify(tokens), credsContext(vaultId)) });
+		await this.ctx.storage.put({ meta, ...(await this.#sealTokens(key, vaultId, tokens)) });
+		await this.#escrow(key, vaultId);
 		await this.#scheduleAlarm();
 	}
 
@@ -228,7 +243,8 @@ export class Vault extends DurableObject<Env> {
 
 	/**
 	 * Keeps the object alive while renders run, then housekeeping: orphaned
-	 * jobs, expired jobs and images, and vaults nobody uses any more.
+	 * jobs, expired jobs and images, vaults nobody uses any more, and the
+	 * background refresh of the ChatGPT sign-in.
 	 */
 	override async alarm(): Promise<void> {
 		while (this.#running.size > 0) {
@@ -237,6 +253,7 @@ export class Vault extends DurableObject<Env> {
 		const now = Date.now();
 		const meta = await this.ctx.storage.get<VaultMeta>("meta");
 		if (!meta || Date.parse(meta.lastUsedAt) + VAULT_IDLE_MS < now) {
+			if (meta) await this.#revokeAbandonedLogin(meta);
 			await this.#deleteEverything();
 			return;
 		}
@@ -248,7 +265,60 @@ export class Vault extends DurableObject<Env> {
 				await this.#markOrphan(job);
 			}
 		}
+		// A failed refresh must not make the runtime retry the whole alarm.
+		await this.#backgroundRefresh(meta).catch(error => {
+			log("warn", "background refresh crashed", { message: error instanceof Error ? error.message : String(error) });
+		});
 		await this.#scheduleAlarm();
+	}
+
+	/**
+	 * Refresh the ChatGPT tokens when the schedule says so, with no client
+	 * involved. A failure that may pass is retried with a growing delay. A
+	 * sign-in OpenAI has ended for good is forgotten, and the client is sent
+	 * through sign-in again on its next call.
+	 */
+	async #backgroundRefresh(meta: VaultMeta): Promise<void> {
+		const state = await this.ctx.storage.get<RefreshState>("refresh");
+		if (!state || state.dueAt > Date.now()) return;
+		const key = await this.#escrowedKey(meta);
+		if (!key) {
+			// No Worker secret, or it changed. The next call from the client stores the key again.
+			await this.ctx.storage.delete("escrow");
+			return;
+		}
+		try {
+			const tokens = await this.#refresh(key, await this.#loadTokens(key), "background");
+			// Also covers a refresh that a concurrent call had already made.
+			const dueAt = Math.max(backgroundRefreshAt(tokens), Date.now() + MIN_BACKGROUND_GAP_MS);
+			await this.ctx.storage.put("refresh", { dueAt, failures: 0 } satisfies RefreshState);
+			log("info", "background refresh", { next: new Date(dueAt).toISOString() });
+		} catch (error) {
+			if (error instanceof AuthRequiredError) {
+				await this.ctx.storage.delete(["escrow", "refresh"]);
+				log("warn", "background refresh: sign-in ended", { reason: error.reason });
+				return;
+			}
+			const failures = state.failures + 1;
+			const dueAt = Date.now() + retryDelay(failures);
+			await this.ctx.storage.put("refresh", { dueAt, failures } satisfies RefreshState);
+			log("warn", "background refresh failed", {
+				failures,
+				retry: new Date(dueAt).toISOString(),
+				error: errorCode(error),
+				message: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	/** Before an unused vault is wiped, end its sign-in at OpenAI too. Best effort. */
+	async #revokeAbandonedLogin(meta: VaultMeta): Promise<void> {
+		try {
+			const key = await this.#escrowedKey(meta);
+			if (key) await revokeTokens(this.#oauthConfig(), await this.#loadTokens(key));
+		} catch {
+			// Nothing usable is stored; there is nothing to revoke.
+		}
 	}
 
 	async #render(job: Job, key: string, request: JobRequest, signal: AbortSignal): Promise<void> {
@@ -356,33 +426,87 @@ export class Vault extends DurableObject<Env> {
 	async #resolveAuth(key: string, rejectedAccessToken?: string): Promise<ResolvedAuth> {
 		let tokens = await this.#loadTokens(key);
 		const rejected = rejectedAccessToken !== undefined && rejectedAccessToken === tokens.accessToken;
-		if (rejected || needsRefresh(tokens)) tokens = await this.#refresh(key, tokens, rejected);
+		if (rejected || needsRefresh(tokens)) tokens = await this.#refresh(key, tokens, rejected ? "rejected" : "due");
+		await this.#enrol(key, tokens);
 		await this.#touch();
 		const identity = readIdentity(tokens.accessToken, tokens.idToken);
 		return { accessToken: tokens.accessToken, accountId: identity.accountId ?? tokens.accountId, identity };
 	}
 
 	/** One refresh at a time: the refresh token is single-use, and losing the replacement loses the login. */
-	#refresh(key: string, observed: StoredTokens, rejected: boolean): Promise<StoredTokens> {
+	#refresh(key: string, observed: StoredTokens, reason: RefreshReason): Promise<StoredTokens> {
 		this.#refreshing ??= (async () => {
 			const latest = await this.#loadTokens(key);
 			if (latest.accessToken !== observed.accessToken && !needsRefresh(latest)) return latest;
-			if (!rejected && !needsRefresh(latest)) return latest;
+			if (reason === "due" && !needsRefresh(latest)) return latest;
 			const meta = await this.#meta();
 			try {
 				const next = await refreshTokens(this.#oauthConfig(), latest);
-				await this.ctx.storage.put("creds", await seal(key, JSON.stringify(next), credsContext(meta.vaultId)));
+				await this.ctx.storage.put(await this.#sealTokens(key, meta.vaultId, next));
 				return next;
 			} catch (error) {
 				// A refresh token that can never work again: forget the login so
 				// the grant gets revoked and the client signs in afresh.
-				if (error instanceof AuthRequiredError) await this.ctx.storage.delete("creds");
+				if (error instanceof AuthRequiredError) await this.ctx.storage.delete(["creds", "escrow", "refresh"]);
 				throw error;
 			}
 		})().finally(() => {
 			this.#refreshing = undefined;
 		});
 		return this.#refreshing;
+	}
+
+	/** The storage entries for a set of tokens: the tokens, encrypted, and when to refresh them next. */
+	async #sealTokens(key: string, vaultId: string, tokens: StoredTokens): Promise<{ creds: Sealed; refresh: RefreshState }> {
+		return {
+			creds: await seal(key, JSON.stringify(tokens), credsContext(vaultId)),
+			refresh: { dueAt: backgroundRefreshAt(tokens), failures: 0 },
+		};
+	}
+
+	/**
+	 * Keep a copy of the vault key that the server can open by itself, so the
+	 * alarm can refresh the tokens. Does nothing without the Worker secret.
+	 */
+	async #escrow(key: string, vaultId: string): Promise<boolean> {
+		const escrowKey = await this.#serverKey();
+		if (!escrowKey) return false;
+		await this.ctx.storage.put("escrow", await seal(escrowKey, key, escrowContext(vaultId)));
+		return true;
+	}
+
+	/**
+	 * Set up the background refresh for a vault that has none: one made before
+	 * background refresh existed, or one whose escrow could no longer be opened.
+	 * `key` has just decrypted the tokens, so it is the right one to keep.
+	 */
+	async #enrol(key: string, tokens: StoredTokens): Promise<void> {
+		if (await this.ctx.storage.get<Sealed>("escrow")) return;
+		const meta = await this.#meta();
+		if (!(await this.#escrow(key, meta.vaultId))) return;
+		if (!(await this.ctx.storage.get<RefreshState>("refresh"))) {
+			await this.ctx.storage.put("refresh", { dueAt: backgroundRefreshAt(tokens), failures: 0 } satisfies RefreshState);
+		}
+		await this.#scheduleAlarm();
+	}
+
+	/** The vault key from the escrow. Undefined when there is no escrow or the Worker secret cannot open it. */
+	async #escrowedKey(meta: VaultMeta): Promise<string | undefined> {
+		const [escrow, escrowKey] = await Promise.all([this.ctx.storage.get<Sealed>("escrow"), this.#serverKey()]);
+		if (!escrow || !escrowKey) return undefined;
+		try {
+			return await unseal(escrowKey, escrow, escrowContext(meta.vaultId));
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** The key that seals escrows, derived from the Worker secret so that secret is never used directly. */
+	#serverKey(): Promise<string | undefined> {
+		const secret = this.env.IMAGE_URL_SECRET;
+		// The same minimum as for signing image links (images.ts).
+		this.#escrowKey ??= secret && secret.length >= 32 ? hmacSha256(secret, ESCROW_KEY_LABEL) : Promise.resolve(undefined);
+		return this.#escrowKey;
 	}
 
 	async #loadTokens(key: string): Promise<StoredTokens> {
@@ -457,13 +581,18 @@ export class Vault extends DurableObject<Env> {
 		await this.ctx.storage.deleteAll();
 	}
 
-	/** Next housekeeping: the earliest job expiry, or the idle deadline. */
+	/** Next alarm: the earliest job expiry, the next background refresh, or the idle deadline. */
 	async #scheduleAlarm(): Promise<void> {
 		const meta = await this.ctx.storage.get<VaultMeta>("meta");
 		if (!meta) return;
 		let next = Date.parse(meta.lastUsedAt) + VAULT_IDLE_MS;
 		const jobs = await this.ctx.storage.list<Job>({ prefix: "job:" });
 		for (const job of jobs.values()) next = Math.min(next, Date.parse(job.createdAt) + job.ttlMs + 1000);
+		const [refresh, escrow] = await Promise.all([
+			this.ctx.storage.get<RefreshState>("refresh"),
+			this.ctx.storage.get<Sealed>("escrow"),
+		]);
+		if (refresh && escrow) next = Math.min(next, refresh.dueAt);
 		const current = await this.ctx.storage.getAlarm();
 		if (current === null || current > next || this.#running.size === 0) await this.ctx.storage.setAlarm(next);
 	}
@@ -486,13 +615,12 @@ function credsContext(vaultId: string): string {
 	return `oai-image/vault/${vaultId}/creds`;
 }
 
-function needsRefresh(tokens: StoredTokens): boolean {
-	const last = tokens.lastRefresh ? Date.parse(tokens.lastRefresh) : Number.NaN;
-	if (Number.isFinite(last) && last < Date.now() - KEEP_FRESH_MS) return true;
-	const expiresAt = jwtExpiresAt(tokens.accessToken);
-	if (expiresAt !== undefined) return expiresAt <= Date.now() + REFRESH_WINDOW_MS;
-	return Number.isFinite(last) && last < Date.now() - REFRESH_INTERVAL_MS;
+function escrowContext(vaultId: string): string {
+	return `oai-image/vault/${vaultId}/escrow`;
 }
+
+/** Domain separation for the escrow key, so it differs from every other use of the Worker secret. */
+const ESCROW_KEY_LABEL = "oai-image/vault-escrow/v1";
 
 const RENDERING_MESSAGE = "Rendering. This usually takes 20 seconds to 2 minutes.";
 

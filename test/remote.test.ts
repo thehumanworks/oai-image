@@ -36,6 +36,12 @@ let backendOverride: (() => Reply) | undefined;
 let inFlight = 0;
 let maxInFlight = 0;
 let refreshFails = false;
+/** The issuer answers refreshes with a 503, as in an outage. */
+let refreshUnavailable = false;
+/** Which sign-in each ChatGPT refresh token belongs to, so a refresh keeps its identity. */
+const refreshOwners = new Map<string, typeof nextIdentity>();
+/** The email of every ChatGPT refresh the issuer was asked for, in order. */
+const chatGptRefreshes: string[] = [];
 
 before(async () => {
 	if (!enabled) return;
@@ -48,9 +54,13 @@ before(async () => {
 			return approve ? { json: { authorization_code: "auth-code", code_verifier: "verifier" } } : { status: 403, json: {} };
 		}
 		if (route === "/oauth/token") {
-			const identity = nextIdentity;
 			const isRefresh = request.json?.grant_type === "refresh_token";
+			const identity = (isRefresh ? refreshOwners.get(request.json?.refresh_token) : undefined) ?? nextIdentity;
+			if (isRefresh) chatGptRefreshes.push(identity.email);
 			if (isRefresh && refreshFails) return { status: 401, json: { error: { code: "refresh_token_expired", message: "expired" } } };
+			if (isRefresh && refreshUnavailable) return { status: 503, text: "upstream connect error" };
+			const refreshToken = `refresh-${randomBytes(8).toString("hex")}`;
+			refreshOwners.set(refreshToken, identity);
 			return {
 				json: {
 					access_token: accessToken({
@@ -59,7 +69,7 @@ before(async () => {
 						nonce: randomBytes(4).toString("hex"),
 						extra: { chatgpt_user_id: identity.userId },
 					}),
-					refresh_token: `refresh-${randomBytes(4).toString("hex")}`,
+					refresh_token: refreshToken,
 					id_token: makeJwt({
 						email: identity.email,
 						"https://api.openai.com/auth": { chatgpt_account_id: identity.accountId, chatgpt_plan_type: "plus" },
@@ -167,12 +177,11 @@ interface Login {
 	clientId: string;
 	accessToken: string;
 	refreshToken: string;
+	/** Lifetime of the access token, in seconds. */
+	expiresIn: number;
 }
 
-/** The whole sign-in an MCP client and its user go through: register, authorize, consent, device code, token. */
-async function signIn(identity: typeof nextIdentity): Promise<Login> {
-	nextIdentity = identity;
-	approve = false;
+async function registerClient(): Promise<string> {
 	const registration = await fetch(`${base}/oauth/register`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -185,7 +194,17 @@ async function signIn(identity: typeof nextIdentity): Promise<Login> {
 		}),
 	});
 	assert.equal(registration.status, 201, await registration.clone().text());
-	const { client_id: clientId } = (await registration.json()) as { client_id: string };
+	return ((await registration.json()) as { client_id: string }).client_id;
+}
+
+/**
+ * The whole sign-in an MCP client and its user go through: register, authorize, consent, device code, token.
+ * Pass `existingClientId` to sign in again from an app that is already registered.
+ */
+async function signIn(identity: typeof nextIdentity, existingClientId?: string): Promise<Login> {
+	nextIdentity = identity;
+	approve = false;
+	const clientId = existingClientId ?? (await registerClient());
 
 	const verifier = randomBytes(32).toString("base64url");
 	const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -259,9 +278,9 @@ async function signIn(identity: typeof nextIdentity): Promise<Login> {
 		}),
 	});
 	assert.equal(token.status, 200, await token.clone().text());
-	const tokens = (await token.json()) as { access_token: string; refresh_token: string; scope: string };
+	const tokens = (await token.json()) as { access_token: string; refresh_token: string; scope: string; expires_in: number };
 	assert.equal(tokens.scope, "images");
-	return { clientId, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+	return { clientId, accessToken: tokens.access_token, refreshToken: tokens.refresh_token, expiresIn: tokens.expires_in };
 }
 
 let requestId = 0;
@@ -582,6 +601,102 @@ test("remote: refreshing the MCP token keeps the ChatGPT sign-in fresh", { skip:
 	} finally {
 		refreshFails = false;
 	}
+});
+
+test("remote: signing in again leaves the account's other connections signed in", { skip: !enabled }, async () => {
+	// The same person connects the same app twice, e.g. on a laptop and on a phone.
+	const identity = { email: "fifth@example.com", userId: "user-fifth", accountId: "acct-fifth", expiresIn: 3600 };
+	const laptop = await signIn(identity);
+	const phone = await signIn(identity, laptop.clientId);
+	for (const login of [laptop, phone]) {
+		const status = await rpc(login.accessToken, "tools/call", { name: "auth_status", arguments: {} });
+		assert.equal(status.status, 200);
+		assert.match(status.result.content[0].text, /fifth@example\.com/);
+	}
+	const refreshed = await refreshMcp(laptop);
+	assert.equal(refreshed.status, 200, await refreshed.clone().text());
+
+	// Signing one out does not touch the other.
+	const out = await rpc(phone.accessToken, "tools/call", { name: "sign_out", arguments: {} });
+	assert.match(out.result.content[0].text, /Signed out/);
+	assert.equal((await rpc(phone.accessToken, "tools/list")).status, 401);
+	const still = await rpc(laptop.accessToken, "tools/call", { name: "auth_status", arguments: {} });
+	assert.match(still.result.content[0].text, /fifth@example\.com/);
+});
+
+test("remote: MCP access tokens last 30 days, so clients rarely have to refresh", { skip: !enabled }, async () => {
+	const thirtyDays = 30 * 24 * 60 * 60;
+	assert.equal(first.expiresIn, thirtyDays);
+	const refreshed = await refreshMcp(first);
+	assert.equal(refreshed.status, 200, await refreshed.clone().text());
+	const tokens = (await refreshed.json()) as { access_token: string; refresh_token: string; expires_in: number };
+	assert.equal(tokens.expires_in, thirtyDays);
+	first = { ...first, accessToken: tokens.access_token, refreshToken: tokens.refresh_token };
+});
+
+test("remote: the ChatGPT sign-in is refreshed in the background, with no client connected", { skip: !enabled }, async () => {
+	// A ChatGPT access token about to expire: the server must renew it on its own.
+	const identity = { email: "sixth@example.com", userId: "user-sixth", accountId: "acct-sixth", expiresIn: 8 };
+	const login = await signIn(identity);
+	const refreshes = () => chatGptRefreshes.filter(email => email === identity.email).length;
+	assert.equal(refreshes(), 0);
+	// No request from the client from here on.
+	const deadline = Date.now() + 30_000;
+	while (refreshes() === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 250));
+	assert.equal(refreshes(), 1, "the server refreshed the ChatGPT tokens by itself");
+
+	// The renewed sign-in was stored: the next call uses it without refreshing again.
+	const status = await rpc(login.accessToken, "tools/call", { name: "auth_status", arguments: {} });
+	assert.match(status.result.content[0].text, /sixth@example\.com/);
+	const refreshed = await refreshMcp(login);
+	assert.equal(refreshed.status, 200, await refreshed.clone().text());
+	assert.equal(refreshes(), 1);
+});
+
+test("remote: a background refresh that OpenAI rejects for good ends the connection", { skip: !enabled }, async () => {
+	const identity = { email: "seventh@example.com", userId: "user-seventh", accountId: "acct-seventh", expiresIn: 8 };
+	refreshFails = true;
+	try {
+		const login = await signIn(identity);
+		const attempts = () => chatGptRefreshes.filter(email => email === identity.email).length;
+		const deadline = Date.now() + 30_000;
+		while (attempts() === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 250));
+		assert.equal(attempts(), 1);
+		await new Promise(resolve => setTimeout(resolve, 500));
+		// The client is told to sign in again, and the server does not keep retrying a dead login.
+		const status = await rpc(login.accessToken, "tools/call", { name: "auth_status", arguments: {} });
+		assert.equal(status.result.isError, true);
+		assert.match(status.result.content[0].text, /sign in with ChatGPT again/i);
+		assert.equal((await rpc(login.accessToken, "tools/list")).status, 401);
+		await new Promise(resolve => setTimeout(resolve, 6000));
+		assert.equal(attempts(), 1);
+	} finally {
+		refreshFails = false;
+	}
+});
+
+test("remote: a background refresh that fails for a passing reason keeps the user signed in", { skip: !enabled }, async () => {
+	const identity = { email: "eighth@example.com", userId: "user-eighth", accountId: "acct-eighth", expiresIn: 8 };
+	const attempts = () => chatGptRefreshes.filter(email => email === identity.email).length;
+	let login: Login;
+	refreshUnavailable = true;
+	try {
+		login = await signIn(identity);
+		const deadline = Date.now() + 30_000;
+		while (attempts() === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 250));
+		assert.equal(attempts(), 1);
+		// The retry waits a minute; it does not hammer the sign-in service.
+		await new Promise(resolve => setTimeout(resolve, 3000));
+		assert.equal(attempts(), 1);
+	} finally {
+		refreshUnavailable = false;
+	}
+	// The sign-in is still there, and the next call renews it.
+	const status = await rpc(login.accessToken, "tools/call", { name: "auth_status", arguments: {} });
+	assert.match(status.result.content[0].text, /eighth@example\.com/);
+	const refreshed = await refreshMcp(login);
+	assert.equal(refreshed.status, 200, await refreshed.clone().text());
+	assert.equal(attempts(), 2);
 });
 
 test("remote: unknown image links are 404", { skip: !enabled }, async () => {
