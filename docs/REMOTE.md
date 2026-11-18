@@ -34,29 +34,35 @@ MCP access token ──unwraps──▶ grant props { vaultId, vaultKey }   (OAu
                                       │
                                       ▼
                      Vault Durable Object "vaultId"
-                     creds = AES-256-GCM(vaultKey, ChatGPT tokens, bound to vaultId)
-                     jobs  = { status, result metadata }          images → R2 img/<job id>/
+                     creds  = AES-256-GCM(vaultKey, ChatGPT tokens, bound to vaultId)
+                     escrow = AES-256-GCM(key derived from IMAGE_URL_SECRET, vaultKey, bound to vaultId)
+                     jobs   = { status, result metadata }         images → R2 img/<job id>/
 ```
 
-- Each authorization gets its **own vault** (a Durable Object) and its **own random 256-bit key**. The key is stored only in the grant's props, which the OAuth provider encrypts with a key wrapped by the grant's tokens. KV holds only hashes of tokens.
-- So reading KV, Durable Object storage or R2, alone or together, does not reveal anyone's ChatGPT tokens. Using a sign-in requires a live MCP token for that grant.
+- Each authorization gets its **own vault** (a Durable Object) and its **own random 256-bit key**. The key is stored in the grant's props, which the OAuth provider encrypts with a key wrapped by the grant's tokens. KV holds only hashes of tokens.
+- The vault keeps a second copy of that key, the **escrow**, encrypted with a key derived from the Worker secret `IMAGE_URL_SECRET` (HMAC-SHA256 with its own label, so the secret is never used directly). This is what lets the server refresh a sign-in in the background, with no client connected.
+- So reading KV, Durable Object storage or R2, alone or together, does not reveal anyone's ChatGPT tokens. Using a sign-in takes a live MCP token for that grant, or the stored data **and** the Worker secret. Keep the secret out of logs and repositories. If you rotate it, background refresh pauses for each vault until its client next calls, which stores a new escrow.
 - A request can only reach the vault named in its own grant. Task and job ids are 192-bit random and are looked up inside the caller's vault, so another user's task id is simply "not found" (`-32602`). There is no `tasks/list`.
 - ChatGPT refresh tokens are single-use. Each vault serializes its refreshes, so concurrent calls never burn the login.
 - If OpenAI rejects the refresh token (expired, revoked, reused), the vault forgets the login and the server revokes the grant, so the client signs in again instead of failing forever.
 - `sign_out` revokes the refresh token at OpenAI, deletes the vault, its jobs and images, and revokes the grant.
-- Housekeeping: jobs and images are deleted after 24 hours; a vault unused for 400 days is wiped.
+- Each sign-in is its own grant and vault. Signing in again, from the same app or another one, never ends an earlier connection; `sign_out` ends only the connection it is called on.
+- Housekeeping: jobs and images are deleted after 24 hours; a vault unused for 400 days is wiped, and its sign-in is revoked at OpenAI first.
 
 ### How long a sign-in lasts
 
 Users sign in once. The server keeps both halves of the sign-in alive on its own:
 
-- **ChatGPT tokens** are refreshed automatically: before any call when the access token is within 5 minutes of expiring, and at least once every 7 days while the connection is in use, so the refresh token keeps rotating and never goes stale at OpenAI.
-- **The MCP connection**: access tokens last 1 hour and clients refresh them silently. Each of those refreshes also tops up the ChatGPT sign-in when it is due, so a connected client keeps it fresh even when it makes no images. The grant's refresh token lasts a year and is extended on every refresh, so a connection used at least once a year never expires.
-- The sign-in ends only when the user signs out, when OpenAI ends it (password change, revoked session, "log out of all devices"), or after a year with no use. In the first two cases the server ends the grant too, and the client takes the user through sign-in again automatically.
+- **ChatGPT tokens** are refreshed **in the background** by each vault's alarm, whether or not a client is connected: 7 days after the last refresh, or an hour before the access token expires if that comes first. The refresh token therefore keeps rotating and never goes stale at OpenAI, however long the client stays away. A refresh that fails for a passing reason (network, a 5xx from OpenAI) is retried after 1 minute, doubling up to 6 hours. A call that finds the tokens due refreshes them first, as a backstop.
+- **The MCP connection**: access tokens last **30 days**, so clients seldom need to refresh, and a session that was handed an access token keeps working for weeks. The grant's refresh token lasts a year and is extended on every refresh, so a connection used at least once a year never expires.
+- **Several connections** to one ChatGPT account live side by side. A new sign-in does not revoke the others, even from the same app. Apps that share one client id across devices and sessions would otherwise sign each other out.
+- The sign-in ends only when the user signs out, when OpenAI ends it (password change, revoked session, "log out of all devices"), or after a year with no use. When OpenAI ends it, the vault forgets the login, the server ends the grant on the client's next call, and the client takes the user through sign-in again.
 
-The one gap is a client left unused for a long time: refreshes happen on use, because the server cannot unlock a ChatGPT login without that user's own token. If OpenAI expires an unused refresh token before the client comes back, that user signs in again.
+Background refresh needs the escrow described above, so it needs `IMAGE_URL_SECRET` to be set. A vault created before background refresh existed joins in the first time its client calls or refreshes its MCP token.
 
-Background renders run inside the vault. The ChatGPT access token they need lives only in memory for the render; nothing decryptable is written for them. If the object restarts mid-render (a deploy, a rare eviction) the job ends as "interrupted" and the user can retry.
+Shorter-lived access tokens are safer if a token leaks, and longer-lived ones sign users out less. `ACCESS_TOKEN_TTL` in `src/remote/worker.ts` sets the balance. `sign_out` and revoking a grant end its access tokens at once, whatever their age.
+
+Background renders run inside the vault. The ChatGPT access token they need lives only in memory for the render. If the object restarts mid-render (a deploy, a rare eviction) the job ends as "interrupted" and the user can retry.
 
 What this does not protect against: whoever controls the Cloudflare account can change the code to capture tokens as they are used. Only deploy to an account you trust, and tell your users who runs the server.
 
@@ -77,7 +83,7 @@ Optional:
 
 - **Custom domain**: add a route in `wrangler.jsonc` (`"routes": [{ "pattern": "images.example.com", "custom_domain": true }]`) and set `PUBLIC_URL` to `https://images.example.com`.
 - **Backstop for image storage**: `npx wrangler r2 bucket lifecycle add oai-image-images expire-2d --expire-days 2` deletes any image the 24-hour cleanup missed.
-- **Logs**: `npx wrangler tail`, or Workers Logs in the dashboard. Each render logs one JSON line: `render finished` (sent and actual size, warning codes, request id) or `render failed` (error code, HTTP status, `cf-ray`, `cf-mitigated`, request id, requested size, queue length). Tokens, prompts and images are never logged.
+- **Logs**: `npx wrangler tail`, or Workers Logs in the dashboard. Each render logs one JSON line: `render finished` (sent and actual size, warning codes, request id) or `render failed` (error code, HTTP status, `cf-ray`, `cf-mitigated`, request id, requested size, queue length). Each background refresh logs `background refresh` (when the next one is due), `background refresh failed` (error code, when it retries) or `background refresh: sign-in ended`. Tokens, prompts and images are never logged.
 
 ## Connect a client
 
@@ -100,7 +106,7 @@ Claude.ai, ChatGPT and other apps: add a custom connector with the same URL. The
 
 ```sh
 npm run dev:remote          # wrangler dev on http://localhost:8787 (put IMAGE_URL_SECRET in .dev.vars)
-npm run test:remote         # end-to-end: OAuth, device sign-in, tasks, 2025 fallback, isolation, sign-out
+npm run test:remote         # end-to-end: OAuth, device sign-in, tasks, 2025 fallback, isolation, token refresh, sign-out
 npm run types:remote        # regenerate src/remote/worker-configuration.d.ts after editing wrangler.jsonc
 ```
 

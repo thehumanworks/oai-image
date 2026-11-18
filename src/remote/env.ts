@@ -12,7 +12,10 @@ export interface Env {
 	OAUTH_PROVIDER: OAuthHelpers;
 	/** Public origin, e.g. `https://oai-image.example.workers.dev`. Default: the request's origin. */
 	PUBLIC_URL?: string;
-	/** Secret for signing image download links (`wrangler secret put IMAGE_URL_SECRET`). */
+	/**
+	 * Server secret (`wrangler secret put IMAGE_URL_SECRET`). Signs image download
+	 * links, and a key derived from it seals each vault's escrow for background refresh.
+	 */
 	IMAGE_URL_SECRET: string;
 	/** Test overrides for the ChatGPT sign-in service and backend. */
 	OAI_IMAGE_ISSUER?: string;
